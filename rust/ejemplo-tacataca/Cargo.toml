@@ -1,0 +1,8 @@
+[package]
+name = "ejemplo-tacataca"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+networkcore = { path = "../networkcore" }
+tokio = { version = "1", features = ["full"] }
