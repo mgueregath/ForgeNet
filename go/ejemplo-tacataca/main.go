@@ -7,7 +7,9 @@ package main
 
 import (
 	"encoding/binary"
+	"fmt"
 	"log"
+	"net/http"
 	"sync"
 
 	"nucleo-multiplayer/networkcore"
@@ -118,9 +120,44 @@ func main() {
 	state := &tacaTacaState{}
 	state.attachTo(host)
 
+	// Transporte UDP — clientes nativos (ej. Unity).
 	if err := host.Start(9999); err != nil {
-		log.Fatalf("error: %v", err)
+		log.Fatalf("error arrancando UDP: %v", err)
 	}
 
+	// Transporte WebTransport — clientes de navegador. Mismo host, misma
+	// partida: un cliente UDP y uno de navegador conectados a la vez
+	// terminan jugando juntos (ver TestUDPAndWebTransportSamePlayerSpace
+	// en networkcore).
+	devCert, err := host.StartWebTransport(networkcore.WebTransportOptions{Addr: ":9443"})
+	if err != nil {
+		log.Fatalf("error arrancando WebTransport: %v", err)
+	}
+	log.Printf("🔑 Certificate hash (sha-256, base64): %s", devCert.HashBase64)
+
+	// Servidor HTTP aparte, solo para servir la página de prueba del
+	// navegador (nucleo-multiplayer/web/) y exponer el hash del
+	// certificado dev sin tener que copiarlo a mano.
+	startBrowserPageServer(devCert.HashBase64)
+
 	select {}
+}
+
+func startBrowserPageServer(certHash string) {
+	const addr = ":8080"
+	const webDir = "../../web" // nucleo-multiplayer/go/ejemplo-tacataca -> nucleo-multiplayer/web
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/certhash", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		fmt.Fprint(w, certHash)
+	})
+	mux.Handle("/", http.FileServer(http.Dir(webDir)))
+
+	go func() {
+		log.Printf("🌐 Página de prueba en http://localhost%s/", addr)
+		if err := http.ListenAndServe(addr, mux); err != nil {
+			log.Printf("servidor de página de prueba detenido: %v", err)
+		}
+	}()
 }

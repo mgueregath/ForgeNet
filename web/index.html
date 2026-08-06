@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <title>nucleo-multiplayer — cliente de navegador (WebTransport)</title>
+  <style>
+    body { font-family: monospace; background: #111; color: #eee; padding: 2rem; }
+    #log { white-space: pre-wrap; background: #000; padding: 1rem; border-radius: 4px; }
+    .ok { color: #6f6; }
+    .err { color: #f66; }
+  </style>
+</head>
+<body>
+  <h1>nucleo-multiplayer — cliente de navegador</h1>
+  <p>Se conecta vía WebTransport (QUIC) al mismo <code>NetworkHost</code> que los clientes UDP (ej. Unity).</p>
+  <div id="log">Conectando...</div>
+
+  <script type="module">
+    import { NetworkClient } from "./dist/networkcore.js";
+    import { decodeTacaTacaState } from "./dist/ejemplo-tacataca.js";
+
+    const logEl = document.getElementById("log");
+    function log(msg, cls) {
+      const line = document.createElement("div");
+      if (cls) line.className = cls;
+      line.textContent = msg;
+      logEl.appendChild(line);
+    }
+
+    // data-testid en window para que Playwright pueda leer el estado sin
+    // parsear texto — ver web/README.md.
+    window.__testState = { connected: false, playerId: 0, decoded: null, pongMs: null };
+
+    async function main() {
+      logEl.textContent = "";
+
+      let certHash;
+      try {
+        const resp = await fetch("/certhash");
+        certHash = (await resp.text()).trim();
+        log(`Certificate hash obtenido: ${certHash}`);
+      } catch (e) {
+        log(`No se pudo obtener /certhash: ${e}`, "err");
+        return;
+      }
+
+      const client = new NetworkClient();
+      client.onSnapshot = (snap) => {
+        if (snap.statePayload.length > 0) {
+          const decoded = decodeTacaTacaState(snap.statePayload);
+          window.__testState.decoded = decoded;
+        }
+      };
+      client.onPong = (ms) => {
+        window.__testState.pongMs = ms;
+        log(`pong: ${ms}ms`);
+      };
+
+      const url = `https://${location.hostname}:9443/webtransport`;
+      log(`Conectando a ${url}...`);
+
+      const connected = await client.connect(url, { certificateHashBase64: certHash });
+      if (!connected) {
+        log("Handshake falló", "err");
+        return;
+      }
+
+      window.__testState.connected = true;
+      window.__testState.playerId = client.playerId;
+      log(`Conectado. playerId=${client.playerId}`, "ok");
+
+      window.__testClient = client; // para que el test dispare inputs a mano
+    }
+
+    main().catch((e) => log(`Error: ${e}`, "err"));
+  </script>
+</body>
+</html>

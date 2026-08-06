@@ -4,18 +4,25 @@ Implementación del protocolo UDP genérico de este proyecto — **en 6
 lenguajes**, todos con la misma arquitectura: el core de red no sabe nada
 del juego que corre encima. Cada lenguaje vive en su propia carpeta, con
 su propio `networkcore` (librería) + `ejemplo-tacataca` (o `test`, según el
-rol) que demuestra la genericidad.
+rol) que demuestra la genericidad. Además, **`go/networkcore` acepta dos
+transportes a la vez** (UDP crudo y WebTransport/QUIC), lo que permite que
+una página web se conecte directamente al mismo core que usan los clientes
+nativos — ver `web/`.
 
 ```
 nucleo-multiplayer/
   go/           servidor (host) — Go se queda como la referencia para la
-                topología Servidor Dedicado clásica
+                topología Servidor Dedicado clásica. Acepta UDP y
+                WebTransport a la vez, en la misma partida.
   rust/         servidor (host)
   python/       servidor (host) + cliente — único lenguaje con ambos roles
   cpp/          servidor (host), header-only
-  typescript/   cliente — nunca tuvo servidor en este proyecto
+  typescript/   cliente (Node.js, vía dgram) — nunca tuvo servidor
   csharp/       servidor (host embebido) + cliente — la base real para
                 taca-taca en Unity (Android + iOS)
+  web/          cliente de NAVEGADOR (vía WebTransport, no dgram — un
+                browser no puede abrir sockets UDP). No es un lenguaje
+                nuevo, es un transporte nuevo sobre el mismo protocolo.
 ```
 
 ## Genericidad: ningún core sabe qué juego corre encima
@@ -106,15 +113,35 @@ conectado) — ver la sección de estado por lenguaje abajo.
 go/
   networkcore/          librería (handshake, heartbeat, input, snapshot,
                         reliable, ping + hooks genéricos)
-  networkcore/host_test.go   2 tests, incl. regresión de heartbeat (12s)
-  ejemplo-tacataca/     binario que engancha Ball/Rod/Score al core
+    host.go                    lógica del protocolo — agnóstica al
+                               transporte, habla con Peer (interfaz)
+    transport_udp.go            Peer para UDP crudo (clientes nativos)
+    transport_webtransport.go   Peer para WebTransport/QUIC (navegador) +
+                                generador de certificado dev
+    host_test.go                 2 tests, incl. heartbeat (12s)
+    webtransport_test.go         2 tests: WebTransport solo, y UDP +
+                                 WebTransport conectados al mismo host
+                                 A LA VEZ (misma partida, distinto Peer)
+  ejemplo-tacataca/     binario que engancha Ball/Rod/Score al core,
+                        escuchando UDP (:9999) y WebTransport (:9443) a
+                        la vez, más un server HTTP (:8080) que sirve la
+                        página de prueba de web/
 ```
 
 ```bash
 cd nucleo-multiplayer/go
-go test ./networkcore/...        # 2/2 PASS
-go run ./ejemplo-tacataca         # levanta el servidor en :9999
+go test ./networkcore/...        # 4/4 PASS (2 UDP + 2 WebTransport)
+go run ./ejemplo-tacataca         # UDP :9999, WebTransport :9443, HTTP :8080
 ```
+
+**Peer: la abstracción que permite dos transportes en el mismo host.**
+`ClientConnection.Addr *net.UDPAddr` se generalizó a `ClientConnection.Peer`
+(interfaz con `Send([]byte)` + `Key() string`). `host.go` no sabe si un
+paquete vino de un socket UDP o de una sesión WebTransport — cualquier cosa
+que implemente `Peer` puede jugar. Esto es lo que permite que un cliente
+Unity (UDP) y un cliente de navegador (WebTransport) terminen en la misma
+partida sin que el core note la diferencia — verificado en
+`TestUDPAndWebTransportSamePlayerSpace`.
 
 ### Rust (`rust/`)
 
@@ -216,6 +243,33 @@ dotnet run --project NetworkCore.Tests             # 22/22 PASS
 
 Requiere `go` en el PATH para el Test 3 (cross-test) — si no está
 disponible, ese test específico falla pero los otros tres igual corren.
+
+### Web / navegador (`web/`)
+
+No es un lenguaje nuevo — es un **transporte** nuevo (WebTransport/QUIC en
+vez de UDP crudo, porque un navegador no puede abrir sockets UDP) sobre el
+mismo protocolo, hablando con `go/networkcore` vía su nuevo `Peer` de
+WebTransport.
+
+```
+web/
+  networkcore.ts        NetworkClient para navegador (WebTransport en vez
+                        de dgram — dgram es Node-only, no existe en el browser)
+  ejemplo-tacataca.ts     decodificador del esquema Ball/Rod/Score
+  index.html               página de prueba
+```
+
+```bash
+cd nucleo-multiplayer/web && npm install && npx tsc
+cd ../go/ejemplo-tacataca && go run .   # sirve UDP :9999, WebTransport :9443, HTTP :8080
+# abrir http://localhost:8080/
+```
+
+Validado con **Chrome real** (Playwright, no solo compilación): 7/7 checks
+— handshake WebTransport real, input real, decodificación del esquema
+taca-taca completo en el navegador, ping/pong real. Ver `web/README.md`
+para el detalle (incluye por qué WebTransport y no WebSocket, y las
+limitaciones del certificado de desarrollo).
 
 ## Qué falta (ver `arquitectura/ARQUITECTURA_MULTIPLAYER_GENERICA.md` §5-6)
 

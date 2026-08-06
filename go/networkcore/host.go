@@ -1,8 +1,6 @@
 package networkcore
 
 import (
-	"log"
-	"net"
 	"sync"
 	"time"
 )
@@ -16,11 +14,22 @@ const (
 	inputQueueMax    = 1024
 )
 
+// Peer es la identidad de un cliente a nivel transporte — un socket UDP
+// crudo (ver transport_udp.go) o una sesión WebTransport (ver
+// transport_webtransport.go). El core no distingue entre ambos: cualquier
+// cosa que pueda mandar bytes y tenga una clave estable sirve. Esto es lo
+// que permite que clientes Unity (UDP) y clientes de navegador
+// (WebTransport) jueguen en la misma partida, contra el mismo NetworkHost.
+type Peer interface {
+	Send(data []byte)
+	Key() string
+}
+
 // ClientConnection: estado de sesión de un cliente. No tiene ningún campo
 // de estado de juego — eso vive en el juego, no acá.
 type ClientConnection struct {
 	PlayerID      uint16
-	Addr          *net.UDPAddr
+	Peer          Peer
 	LastSeq       uint32
 	LastHeartbeat time.Time
 	Ping          int
@@ -38,13 +47,11 @@ type reliableMessage struct {
 
 // NetworkHost: rol "servidor" del protocolo. No sabe nada del juego que
 // corre encima — se engancha vía los campos de callback de abajo, igual
-// que NetworkHost en el core de C#.
+// que NetworkHost en el core de C#. Tampoco sabe de qué transporte vienen
+// los paquetes (UDP, WebTransport, o ambos a la vez) — ver Peer.
 type NetworkHost struct {
-	conn *net.UDPConn
-	port uint16
-
 	clients      map[uint16]*ClientConnection
-	clientsByKey map[string]*ClientConnection // key = addr.String()
+	clientsByKey map[string]*ClientConnection // key = Peer.Key()
 	clientsMux   sync.RWMutex
 
 	nextPlayerID    uint16
@@ -57,6 +64,10 @@ type NetworkHost struct {
 
 	inputQueue chan PlayerInput
 	running    bool
+	loopsOnce  sync.Once
+
+	closers    []func()
+	closersMux sync.Mutex
 
 	// --- Hooks genéricos: acá es donde el juego se engancha ---
 	OnPlayerConnected    func(playerID uint16)
@@ -76,35 +87,43 @@ func NewNetworkHost() *NetworkHost {
 	}
 }
 
-// Start liga el socket UDP y arranca los loops en background.
-func (h *NetworkHost) Start(port uint16) error {
-	addr := net.UDPAddr{Port: int(port), IP: net.ParseIP("0.0.0.0")}
-	conn, err := net.ListenUDP("udp", &addr)
-	if err != nil {
-		return err
-	}
-
-	conn.SetReadBuffer(1 << 20)
-	conn.SetWriteBuffer(1 << 20)
-
-	h.conn = conn
-	h.port = port
-	h.running = true
-
-	go h.receiveLoop()
-	go h.gameLoop()
-	go h.sendLoop()
-	go h.heartbeatLoop()
-
-	log.Printf("🎮 NetworkHost escuchando en :%d (60Hz)", port)
-	return nil
-}
-
+// Stop detiene los loops de fondo (tick, retransmisión, heartbeat) y cierra
+// todos los transportes activos (sockets UDP, listener WebTransport) —
+// cualquier transporte que se haya registrado vía registerCloser.
 func (h *NetworkHost) Stop() {
 	h.running = false
-	if h.conn != nil {
-		h.conn.Close()
+
+	h.closersMux.Lock()
+	closers := h.closers
+	h.closers = nil
+	h.closersMux.Unlock()
+
+	for _, close := range closers {
+		close()
 	}
+}
+
+// registerCloser: cada transporte (StartUDP, StartWebTransport) registra
+// acá cómo cerrarse, para que Stop() pueda desbloquear sus loops de
+// recepción (ej. un ReadFromUDP bloqueado no se entera de que running
+// pasó a false hasta que el socket se cierra).
+func (h *NetworkHost) registerCloser(closeFn func()) {
+	h.closersMux.Lock()
+	defer h.closersMux.Unlock()
+	h.closers = append(h.closers, closeFn)
+}
+
+// ensureLoopsStarted arranca el tick loop, la retransmisión de confiables y
+// el heartbeat — comunes a cualquier transporte. Es seguro llamarlo desde
+// StartUDP y StartWebTransport a la vez: sync.Once garantiza que los loops
+// arrancan una sola vez sin importar cuántos transportes se agreguen.
+func (h *NetworkHost) ensureLoopsStarted() {
+	h.loopsOnce.Do(func() {
+		h.running = true
+		go h.gameLoop()
+		go h.sendLoop()
+		go h.heartbeatLoop()
+	})
 }
 
 // QueueEvent: el juego encola sus propios eventos (ej. GOAL) para que
@@ -121,26 +140,13 @@ func (h *NetworkHost) ConnectedPlayerCount() int {
 	return len(h.clients)
 }
 
-// --- Recepción ---
+// --- Recepción: punto de entrada común para cualquier transporte ---
 
-func (h *NetworkHost) receiveLoop() {
-	buffer := make([]byte, 2048)
-	for h.running {
-		n, remoteAddr, err := h.conn.ReadFromUDP(buffer)
-		if err != nil {
-			if h.running {
-				continue
-			}
-			return
-		}
-
-		packet := make([]byte, n)
-		copy(packet, buffer[:n])
-		h.handlePacket(packet, remoteAddr)
-	}
-}
-
-func (h *NetworkHost) handlePacket(data []byte, addr *net.UDPAddr) {
+// HandlePacket procesa un paquete crudo recibido de un Peer. Cada
+// transporte (UDP, WebTransport) llama a esto por cada paquete que recibe
+// — es la única puerta de entrada al protocolo, sin importar de dónde
+// vino el paquete.
+func (h *NetworkHost) HandlePacket(data []byte, peer Peer) {
 	seq, _, packetType, flags, ok := parseHeader(data)
 	if !ok {
 		return
@@ -148,18 +154,18 @@ func (h *NetworkHost) handlePacket(data []byte, addr *net.UDPAddr) {
 
 	switch packetType {
 	case PacketHandshake:
-		h.handleHandshake(seq, addr)
+		h.handleHandshake(seq, peer)
 	case PacketInput:
-		h.handleInput(seq, addr, flags, data[HeaderSize:])
+		h.handleInput(seq, peer, flags, data[HeaderSize:])
 	case PacketAck:
-		h.handleAck(seq, addr)
+		h.handleAck(seq, peer)
 	case PacketPing:
-		h.handlePing(seq, addr, data[HeaderSize:])
+		h.handlePing(seq, peer, data[HeaderSize:])
 	}
 }
 
-func (h *NetworkHost) handleHandshake(seq uint32, addr *net.UDPAddr) {
-	key := addr.String()
+func (h *NetworkHost) handleHandshake(seq uint32, peer Peer) {
+	key := peer.Key()
 
 	h.clientsMux.Lock()
 	if _, exists := h.clientsByKey[key]; exists {
@@ -172,7 +178,7 @@ func (h *NetworkHost) handleHandshake(seq uint32, addr *net.UDPAddr) {
 
 	client := &ClientConnection{
 		PlayerID:      playerID,
-		Addr:          addr,
+		Peer:          peer,
 		LastSeq:       seq,
 		LastHeartbeat: time.Now(),
 		Connected:     true,
@@ -183,15 +189,15 @@ func (h *NetworkHost) handleHandshake(seq uint32, addr *net.UDPAddr) {
 
 	response := buildHeader(seq, 0, PacketHandshake, 0)
 	response = append(response, byte(playerID>>8), byte(playerID))
-	h.conn.WriteToUDP(response, addr)
+	peer.Send(response)
 
 	if h.OnPlayerConnected != nil {
 		h.OnPlayerConnected(playerID)
 	}
 }
 
-func (h *NetworkHost) handleInput(seq uint32, addr *net.UDPAddr, flags byte, payload []byte) {
-	client := h.findClientByAddr(addr)
+func (h *NetworkHost) handleInput(seq uint32, peer Peer, flags byte, payload []byte) {
+	client := h.findClientByKey(peer.Key())
 	if client == nil {
 		return
 	}
@@ -224,8 +230,8 @@ func (h *NetworkHost) handleInput(seq uint32, addr *net.UDPAddr, flags byte, pay
 	client.LastHeartbeat = time.Now()
 }
 
-func (h *NetworkHost) handleAck(seq uint32, addr *net.UDPAddr) {
-	client := h.findClientByAddr(addr)
+func (h *NetworkHost) handleAck(seq uint32, peer Peer) {
+	client := h.findClientByKey(peer.Key())
 	if client == nil {
 		return
 	}
@@ -241,8 +247,8 @@ func (h *NetworkHost) handleAck(seq uint32, addr *net.UDPAddr) {
 	}
 }
 
-func (h *NetworkHost) handlePing(seq uint32, addr *net.UDPAddr, payload []byte) {
-	client := h.findClientByAddr(addr)
+func (h *NetworkHost) handlePing(seq uint32, peer Peer, payload []byte) {
+	client := h.findClientByKey(peer.Key())
 	if client == nil || len(payload) < 8 {
 		return
 	}
@@ -260,12 +266,12 @@ func (h *NetworkHost) handlePing(seq uint32, addr *net.UDPAddr, payload []byte) 
 		tsBuf[7-i] = byte(serverTime >> (8 * i))
 	}
 	response = append(response, tsBuf...)
-	h.conn.WriteToUDP(response, addr)
+	peer.Send(response)
 }
 
 func (h *NetworkHost) sendAck(client *ClientConnection, seq uint32) {
 	response := buildHeader(seq, seq, PacketAck, 0)
-	h.conn.WriteToUDP(response, client.Addr)
+	client.Peer.Send(response)
 }
 
 // --- Tick de juego ---
@@ -339,7 +345,7 @@ func (h *NetworkHost) broadcastSnapshot() {
 		if !client.Connected {
 			continue
 		}
-		h.conn.WriteToUDP(packet, client.Addr)
+		client.Peer.Send(packet)
 	}
 }
 
@@ -368,7 +374,7 @@ func (h *NetworkHost) sendLoop() {
 			for i := range client.ReliableQueue {
 				msg := &client.ReliableQueue[i]
 				if now.Sub(msg.Sent) > retryInterval && msg.Retries < maxRetries {
-					h.conn.WriteToUDP(msg.Data, client.Addr)
+					client.Peer.Send(msg.Data)
 					msg.Sent = now
 					msg.Retries++
 				}
@@ -403,7 +409,7 @@ func (h *NetworkHost) heartbeatLoop() {
 			client := h.clients[id]
 			client.Connected = false
 			delete(h.clients, id)
-			delete(h.clientsByKey, client.Addr.String())
+			delete(h.clientsByKey, client.Peer.Key())
 		}
 		h.clientsMux.Unlock()
 
@@ -417,10 +423,10 @@ func (h *NetworkHost) heartbeatLoop() {
 
 // --- Helpers ---
 
-func (h *NetworkHost) findClientByAddr(addr *net.UDPAddr) *ClientConnection {
+func (h *NetworkHost) findClientByKey(key string) *ClientConnection {
 	h.clientsMux.RLock()
 	defer h.clientsMux.RUnlock()
-	return h.clientsByKey[addr.String()]
+	return h.clientsByKey[key]
 }
 
 func (h *NetworkHost) nextSeqNumber() uint32 {
