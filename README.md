@@ -1,285 +1,93 @@
-# nucleo-multiplayer
+# ForgeNet
 
-Implementación del protocolo UDP genérico de este proyecto — **en 6
-lenguajes**, todos con la misma arquitectura: el core de red no sabe nada
-del juego que corre encima. Cada lenguaje vive en su propia carpeta, con
-su propio `networkcore` (librería) + `ejemplo-tacataca` (o `test`, según el
-rol) que demuestra la genericidad. Además, **`go/networkcore` acepta dos
-transportes a la vez** (UDP crudo y WebTransport/QUIC), lo que permite que
-una página web se conecte directamente al mismo core que usan los clientes
-nativos — ver `web/`.
+A generic multiplayer networking core, implemented from scratch **in 6 languages** (Go, Rust, Python, C++, TypeScript, C#), sharing the same wire protocol and the same design principle: **the transport layer knows nothing about the game running on top of it.**
+
+Handshake, heartbeat, input, snapshots, reliable delivery and ping are handled by the core. Game state travels as an opaque `StatePayload` — bytes the core moves but never interprets — and the game plugs in through four hooks:
 
 ```
-nucleo-multiplayer/
-  go/           servidor (host) — Go se queda como la referencia para la
-                topología Servidor Dedicado clásica. Acepta UDP y
-                WebTransport a la vez, en la misma partida.
-  rust/         servidor (host)
-  python/       servidor (host) + cliente — único lenguaje con ambos roles
-  cpp/          servidor (host), header-only
-  typescript/   cliente (Node.js, vía dgram) — nunca tuvo servidor
-  csharp/       servidor (host embebido) + cliente — la base real para
-                taca-taca en Unity (Android + iOS)
-  web/          cliente de NAVEGADOR (vía WebTransport, no dgram — un
-                browser no puede abrir sockets UDP). No es un lenguaje
-                nuevo, es un transporte nuevo sobre el mismo protocolo.
+on_player_connected / on_player_disconnected
+on_input          — raw input per tick (delta_x/delta_y/rotation/actions)
+on_tick           — fired once per tick so the game can step its simulation
+state_provider    — the game hands back its current state bytes on each snapshot
+queue_event       — the game queues its own events (e.g. GOAL) with arbitrary type/data
 ```
 
-## Genericidad: ningún core sabe qué juego corre encima
+Every language folder ships a `networkcore` library plus a small `tacataca` example (a 2-paddle ball game) built **on top of** the core — proving the same core can host different games without being touched.
 
-Todos comparten el mismo diseño: el transporte (handshake, heartbeat,
-input, snapshot, reliable, ping) es 100% agnóstico al juego. El estado de
-juego viaja como `StatePayload` — bytes opacos que el core transporta pero
-nunca interpreta — y el juego se conecta vía 4 hooks:
+`go/networkcore` additionally accepts **two transports at once** — raw UDP and WebTransport/QUIC — so a browser tab and a native (Unity) client can be in the same match, talking to the same host, without the core caring which is which.
 
-- `on_player_connected` / `on_player_disconnected`
-- `on_input` — recibe cada input crudo (`delta_x/delta_y/rotation/actions`),
-  sin ninguna interpretación del core
-- `on_tick` — se dispara una vez por tick para que el juego actualice su
-  simulación
-- `state_provider` — el juego entrega los bytes de su estado actual en
-  cada snapshot
-- `queue_event` — el juego encola sus propios eventos (ej. `GOAL`) con
-  tipo/datos arbitrarios
+## Why this exists
 
-**Esto no siempre fue así.** La primera versión (solo en C#) tenía
-`PlayerState{Health,Ammo}` hardcodeado dentro del core, heredado del
-prototipo original de este proyecto (que sí tenía ese esquema fijo en los
-6 lenguajes). Se detectó y corrigió — ver
-`arquitectura/ARQUITECTURA_MULTIPLAYER_GENERICA.md` — y esa corrección se
-aplicó consistentemente al reescribir los otros 5 lenguajes.
+Most open-source netcode libraries commit early to one engine and one language (Mirror and FishNet to Unity/C#, Netcode for GameObjects the same, ENet to a C ABI you bind per-engine). ForgeNet inverts that: the protocol and the state machine are specified once, then implemented natively per language/runtime, so integrating it into a new engine is "write a thin binding," not "port a library."
 
-En cada carpeta, un ejemplo `TacaTacaState`/`TacaTacaGame` (Ball/Rod/Score)
-construido **encima** del core, no dentro de él, demuestra que el diseño
-funciona: si mañana hay otro juego con otro esquema, se escribe una clase
-análoga sin tocar `networkcore`.
+- **Go** is the reference implementation and the target for classic **Dedicated Server** topology (multi-room, many clients, one centralized process).
+- **C#** targets **Embedded Host** topology — the server runs *inside* the client app (e.g. a Unity build hosting a local match), which is why this is the real base for the Unity integration.
+- **Rust, Python, C++, TypeScript** cover server and/or client roles for embedding into engines and tools built on those runtimes (e.g. native plugins, headless simulation, tooling, Node-based clients).
+- **Web** is not a language, it's a transport: a browser can't open raw UDP sockets, so `web/` talks to `go/networkcore` over WebTransport/QUIC instead — same protocol, different `Peer`.
 
-## Por qué 6 lenguajes en vez de uno solo
+## Status
 
-- **Go** es la referencia principal y se queda como la implementación de
-  la topología **Servidor Dedicado clásica** (multi-sala, muchos clientes,
-  un proceso centralizado) — decisión de lenguaje confirmada, no se
-  reemplaza por C#/Unity headless para ese caso.
-- **C#** es necesario porque taca-taca usa la topología **Host Embebido**:
-  el servidor corre *dentro* de la app Unity que renderiza el tablero (no
-  puede ser un proceso Go separado), y el cliente Unity (el "mando")
-  siempre necesita hablar el protocolo en C#.
-- **Rust, Python, C++, TypeScript**: existían en el prototipo original
-  (comparación de lenguajes, benchmarking) y se reescribieron a la misma
-  arquitectura genérica para no dejar implementaciones "de segunda"
-  desactualizadas en el repo.
-- **`client_csharp_unity.cs` del prototipo original quedó retirado, no
-  reescrito** — `csharp/NetworkCore` ya cubre el rol cliente en C# de
-  forma genérica y validada; una tercera variante sería pura duplicación.
+- All 6 implementations are compiled and actually run (not just written) — see the per-language breakdown below.
+- Browser support (WebTransport/QUIC) validated against real Chrome via Playwright, not just compiled: handshake, input, and full game-state decoding in the browser.
+- Cross-language interoperability verified with real cross-process tests, not just self-consistency:
+  - **C# ↔ Go**: `csharp/NetworkCore.Tests` spawns `go/ejemplo-tacataca` as a real subprocess and connects a C# `NetworkClient` against it.
+  - **TypeScript ↔ Go**: `typescript/test-networkcore.ts` connects against a running `go/ejemplo-tacataca`, decoding the full example schema byte-for-byte across languages.
+- A heartbeat bug (last-activity timestamp never refreshed, causing disconnects after ~10s regardless of traffic) was found and fixed across 4 languages (Go, Rust, Python, C++), each with its own regression test.
 
-## Compatibilidad entre lenguajes: verificada, no asumida
-
-Todos comparten el **framing** (header, handshake, input, ack, ping,
-heartbeat) — y ahora, al ser todos genéricos, también comparten el
-**envelope de snapshot** (`Tick + StatePayloadLen + StatePayload +
-EventCount + Events`). Lo que cada juego pone *dentro* de `StatePayload`
-es su propio esquema (ej. taca-taca), pero el transporte es
-interoperable entre lenguajes.
-
-Esto está probado con cross-tests reales entre implementaciones, no solo
-autoconsistencia:
-
-- **C# ↔ Go**: `csharp/NetworkCore.Tests` levanta `go/ejemplo-tacataca`
-  como subproceso real y conecta el `NetworkClient` de C# contra él —
-  handshake, ping, y decodificación del snapshot genérico, todo verificado.
-- **TypeScript ↔ Go**: `typescript/test-networkcore.ts` conecta contra
-  `go/ejemplo-tacataca` corriendo por separado — handshake, ping, y
-  decodificación completa del esquema taca-taca (`Ball/Rod/Score`)
-  codificado por Go y decodificado por TS, byte a byte.
-
-## Heartbeat: el mismo bug, corregido en 4 lenguajes
-
-Antes de reescribir Rust/Python/C++ a la arquitectura genérica, se
-encontró que las tres tenían el mismo bug que ya habíamos corregido en Go:
-el campo de última actividad nunca se refrescaba en los handlers de
-input/ping, así que cualquier cliente se desconectaba a los ~10s sin
-importar cuánto tráfico mandara. Los 4 cores nuevos (Go, Rust, Python, C++)
-tienen el fix desde el diseño, y cada uno tiene un test de regresión
-específico (loop de 12s de actividad, verifica que el cliente siga
-conectado) — ver la sección de estado por lenguaje abajo.
-
----
-
-## Estado por lenguaje (todos compilados y corridos de verdad)
-
-### Go (`go/`)
+## Repository layout
 
 ```
-go/
-  networkcore/          librería (handshake, heartbeat, input, snapshot,
-                        reliable, ping + hooks genéricos)
-    host.go                    lógica del protocolo — agnóstica al
-                               transporte, habla con Peer (interfaz)
-    transport_udp.go            Peer para UDP crudo (clientes nativos)
-    transport_webtransport.go   Peer para WebTransport/QUIC (navegador) +
-                                generador de certificado dev
-    host_test.go                 2 tests, incl. heartbeat (12s)
-    webtransport_test.go         2 tests: WebTransport solo, y UDP +
-                                 WebTransport conectados al mismo host
-                                 A LA VEZ (misma partida, distinto Peer)
-  ejemplo-tacataca/     binario que engancha Ball/Rod/Score al core,
-                        escuchando UDP (:9999) y WebTransport (:9443) a
-                        la vez, más un server HTTP (:8080) que sirve la
-                        página de prueba de web/
+go/           server — Go is the reference implementation for the classic
+              Dedicated Server topology. Accepts UDP and WebTransport at
+              once, in the same match.
+rust/         server
+python/       server + client — the only language with both roles
+cpp/          server, header-only, C++17, no external dependencies
+typescript/   client (Node.js, via dgram)
+csharp/       server (embedded host) + client — the real base for Unity
+              integration
+web/          browser client via WebTransport/QUIC — a browser can't open
+              UDP sockets, so it talks to the same go/networkcore over a
+              different transport
 ```
+
+## Quick start (per language)
 
 ```bash
-cd nucleo-multiplayer/go
-go test ./networkcore/...        # 4/4 PASS (2 UDP + 2 WebTransport)
-go run ./ejemplo-tacataca         # UDP :9999, WebTransport :9443, HTTP :8080
+# Go — reference server (UDP :9999, WebTransport :9443, HTTP :8080)
+cd go && go test ./networkcore/... && go run ./ejemplo-tacataca
+
+# Rust
+cd rust && cargo test -p networkcore && cargo run -p ejemplo-tacataca
+
+# Python — self-test host<->client + example game
+cd python && python3 test_networkcore.py
+
+# C++ — header-only, POSIX sockets
+cd cpp && g++ -std=c++17 -O2 -pthread -o /tmp/test_networkcore tests/test_networkcore.cpp && /tmp/test_networkcore
+
+# TypeScript client — needs go/ejemplo-tacataca already running on :9999
+cd go/ejemplo-tacataca && go run . &
+cd typescript && npx tsc && node dist/test-networkcore.js
+
+# C# — cross-tests against Go require `go` on PATH
+cd csharp && dotnet run --project NetworkCore.Tests
+
+# Web client (WebTransport) — serve go/ejemplo-tacataca, open the browser page
+cd web && npm install && npx tsc
+cd ../go/ejemplo-tacataca && go run .   # then open http://localhost:8080/
 ```
 
-**Peer: la abstracción que permite dos transportes en el mismo host.**
-`ClientConnection.Addr *net.UDPAddr` se generalizó a `ClientConnection.Peer`
-(interfaz con `Send([]byte)` + `Key() string`). `host.go` no sabe si un
-paquete vino de un socket UDP o de una sesión WebTransport — cualquier cosa
-que implemente `Peer` puede jugar. Esto es lo que permite que un cliente
-Unity (UDP) y un cliente de navegador (WebTransport) terminen en la misma
-partida sin que el core note la diferencia — verificado en
-`TestUDPAndWebTransportSamePlayerSpace`.
+Full per-language detail (test counts, design notes, known caveats) lives inline in each folder; see `csharp/`, `go/`, etc.
 
-### Rust (`rust/`)
+## Roadmap
 
-```
-rust/
-  networkcore/          crate (mismo diseño que Go, con EventQueue
-                        clonable para encolar eventos desde hooks
-                        configurados antes de start())
-  networkcore/tests/    2 tests de integración, incl. heartbeat (12s)
-  ejemplo-tacataca/     binario análogo al de Go
-```
+The near-term goal is packaging this as an embeddable library per engine rather than a standalone example:
 
-```bash
-cd nucleo-multiplayer/rust
-cargo test -p networkcore        # 2/2 PASS
-cargo run -p ejemplo-tacataca
-```
+1. **Unity**: a thin `MonoBehaviour` wrapper around `csharp/NetworkCore`'s embedded host — instantiate a real server inside the app when a player hosts a match, and a matching client-only mode ("controller" role) that never renders the authoritative state.
+2. **Role selection + LAN discovery** at app startup — mDNS/Bonjour/NSD from day one (confirmed necessary for iOS; raw UDP broadcast doesn't reach it).
+3. **Godot / Unreal bindings** built the same way: thin native bindings over the existing `cpp/` or language-native cores, no protocol changes required.
 
-Nota de diseño: `queue_event` no puede vivir solo en el "handle" que
-devuelve `start()`, porque los hooks (`on_input`, etc.) se configuran
-*antes* de arrancar. Se resolvió con `EventQueue`, una cola compartible
-que se obtiene con `NetworkHost::events()` antes de `start()` y se clona
-dentro de los hooks que la necesiten.
+## License
 
-### Python (`python/`)
-
-Único lenguaje con **ambos roles** (servidor y cliente) en este proyecto.
-
-```
-python/
-  networkcore.py         NetworkHost + NetworkClient
-  ejemplo_tacataca.py     TacaTacaGame enganchado al host
-  test_networkcore.py     3 baterías, 18 checks — self-test host<->client
-                          + heartbeat (12s) + ejemplo taca-taca
-```
-
-```bash
-cd nucleo-multiplayer/python
-python3 test_networkcore.py      # 18/18 PASS
-```
-
-### C++ (`cpp/`)
-
-Header-only, C++17, sin dependencias externas (POSIX sockets + stdlib —
-se dejó de usar zstd, que estaba en el prototipo original pero ningún
-cliente implementaba la descompresión del lado receptor, un bug latente).
-
-```
-cpp/
-  networkcore/networkcore.hpp   header-only, hooks vía std::function
-  ejemplo-tacataca/main.cpp
-  tests/test_networkcore.cpp    2 baterías, 15 checks, incl. heartbeat (12s)
-```
-
-```bash
-cd nucleo-multiplayer/cpp
-g++ -std=c++17 -O2 -pthread -o /tmp/test_networkcore tests/test_networkcore.cpp
-/tmp/test_networkcore                # 15/15 PASS
-```
-
-### TypeScript (`typescript/`)
-
-Solo cliente (nunca tuvo servidor en este proyecto). Su validación es un
-cross-test real contra Go — no autoconsistencia, porque no hay host propio.
-
-```
-typescript/
-  networkcore.ts          NetworkClient
-  ejemplo-tacataca.ts       decodificador del esquema Ball/Rod/Score
-  test-networkcore.ts       requiere que go/ejemplo-tacataca ya esté
-                            corriendo en :9999 (spawnear procesos desde
-                            Node no es confiable en todos los entornos)
-```
-
-```bash
-cd nucleo-multiplayer/go/ejemplo-tacataca && go run . &   # en otra terminal
-cd nucleo-multiplayer/typescript
-npx tsc && node dist/test-networkcore.js                  # 7/7 PASS
-```
-
-### C# (`csharp/`)
-
-Es la base real para taca-taca (topología Host Embebido). Ver detalle
-completo más abajo.
-
-```
-csharp/
-  NetworkCore/            librería (netstandard2.1, sin UnityEngine)
-  NetworkCore.Tests/       4 baterías, 22 checks, incl. cross-test contra
-                          go/ejemplo-tacataca real (framing + envelope de
-                          snapshot genérico, ahora que ambos lados lo son)
-```
-
-```bash
-export PATH="$PATH:/opt/homebrew/opt/dotnet/bin"   # si dotnet no está en PATH
-cd nucleo-multiplayer/csharp
-dotnet run --project NetworkCore.Tests             # 22/22 PASS
-```
-
-Requiere `go` en el PATH para el Test 3 (cross-test) — si no está
-disponible, ese test específico falla pero los otros tres igual corren.
-
-### Web / navegador (`web/`)
-
-No es un lenguaje nuevo — es un **transporte** nuevo (WebTransport/QUIC en
-vez de UDP crudo, porque un navegador no puede abrir sockets UDP) sobre el
-mismo protocolo, hablando con `go/networkcore` vía su nuevo `Peer` de
-WebTransport.
-
-```
-web/
-  networkcore.ts        NetworkClient para navegador (WebTransport en vez
-                        de dgram — dgram es Node-only, no existe en el browser)
-  ejemplo-tacataca.ts     decodificador del esquema Ball/Rod/Score
-  index.html               página de prueba
-```
-
-```bash
-cd nucleo-multiplayer/web && npm install && npx tsc
-cd ../go/ejemplo-tacataca && go run .   # sirve UDP :9999, WebTransport :9443, HTTP :8080
-# abrir http://localhost:8080/
-```
-
-Validado con **Chrome real** (Playwright, no solo compilación): 7/7 checks
-— handshake WebTransport real, input real, decodificación del esquema
-taca-taca completo en el navegador, ping/pong real. Ver `web/README.md`
-para el detalle (incluye por qué WebTransport y no WebSocket, y las
-limitaciones del certificado de desarrollo).
-
-## Qué falta (ver `arquitectura/ARQUITECTURA_MULTIPLAYER_GENERICA.md` §5-6)
-
-1. Wrapper "Embedded Host" dentro de un proyecto Unity real: un
-   `MonoBehaviour` delgado que instancia `NetworkHost` (de `csharp/`) en
-   la escena del tablero cuando el usuario elige "Crear mesa", enganchando
-   el esquema real de taca-taca con física de verdad (no el placeholder
-   de los ejemplos).
-2. Cliente "mando": UI de control que usa `NetworkClient`, sin renderizar
-   el tablero.
-3. Selector de rol al iniciar la app.
-4. Descubrimiento en LAN — con Bonjour/NSD desde el día uno (Android + iOS
-   confirmados, broadcast UDP crudo no alcanza para iOS).
+MIT — see [LICENSE](LICENSE).
