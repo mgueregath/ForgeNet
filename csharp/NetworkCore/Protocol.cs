@@ -23,6 +23,89 @@ namespace NetworkCore
         public const byte Ordered = 0x04;
     }
 
+    // Modos de handshake — quién crea una sala nueva vs. quién se une a una
+    // existente por código. Esto sí es genérico: cualquier juego con
+    // sesiones de partida necesita esta distinción. Espejo de
+    // HandshakeModeCreate/HandshakeModeJoin en protocol.go.
+    public static class HandshakeMode
+    {
+        public const byte Create = 0x00;
+        public const byte Join = 0x01;
+    }
+
+    // Motivos de rechazo del handshake, enviados en un PacketDisconnect.
+    // Espejo de ReasonRoomNotFound/ReasonRoomFull en protocol.go.
+    public static class DisconnectReason
+    {
+        public const byte RoomNotFound = 0x01;
+        public const byte RoomFull = 0x02;
+    }
+
+    // Payload del handshake (join): Mode(1) + Role(1) + RoomCodeLen(1) +
+    // RoomCode(N bytes ASCII). Va después del header en un PacketHandshake
+    // mandado por el cliente. RoomCode se ignora en HandshakeMode.Create (el
+    // server genera el código). El core no sabe qué juego corre encima, así
+    // que Role viaja como un byte opaco: cada juego define sus propios
+    // valores y su propio significado (ej. taca-taca usa un valor para
+    // "barra" y otro para "tablero" — ver su ejemplo), igual que ya pasa con
+    // StatePayload y GameEvent.EventType.
+    public static class JoinPayload
+    {
+        public static byte[] Encode(byte mode, byte role, string roomCode)
+        {
+            var codeBytes = System.Text.Encoding.ASCII.GetBytes(roomCode ?? "");
+            var buf = new byte[3 + codeBytes.Length];
+            buf[0] = mode;
+            buf[1] = role;
+            buf[2] = (byte)codeBytes.Length;
+            Array.Copy(codeBytes, 0, buf, 3, codeBytes.Length);
+            return buf;
+        }
+
+        public static bool TryDecode(byte[] payload, out byte mode, out byte role, out string roomCode)
+        {
+            mode = 0; role = 0; roomCode = "";
+            if (payload.Length < 3) return false;
+
+            int codeLen = payload[2];
+            if (payload.Length < 3 + codeLen) return false;
+
+            mode = payload[0];
+            role = payload[1];
+            roomCode = System.Text.Encoding.ASCII.GetString(payload, 3, codeLen);
+            return true;
+        }
+    }
+
+    // Payload de la respuesta/ack del handshake: PlayerID(2 BE) +
+    // RoomCodeLen(1) + RoomCode(N). Tanto quien crea la sala como quien se
+    // une reciben el código, para poder compartirlo (ej. un QR).
+    public static class HandshakeAck
+    {
+        public static byte[] Encode(ushort playerId, string roomCode)
+        {
+            var codeBytes = System.Text.Encoding.ASCII.GetBytes(roomCode ?? "");
+            var buf = new byte[3 + codeBytes.Length];
+            BigEndian.WriteUInt16(buf, 0, playerId);
+            buf[2] = (byte)codeBytes.Length;
+            Array.Copy(codeBytes, 0, buf, 3, codeBytes.Length);
+            return buf;
+        }
+
+        public static bool TryDecode(byte[] payload, out ushort playerId, out string roomCode)
+        {
+            playerId = 0; roomCode = "";
+            if (payload.Length < 3) return false;
+
+            int codeLen = payload[2];
+            if (payload.Length < 3 + codeLen) return false;
+
+            playerId = BigEndian.ReadUInt16(payload, 0);
+            roomCode = System.Text.Encoding.ASCII.GetString(payload, 3, codeLen);
+            return true;
+        }
+    }
+
     // Go usa binary.BigEndian en todo el protocolo. .NET (BitConverter) es
     // little-endian en las plataformas donde corre Unity (x86/x64/ARM), así
     // que estos helpers empaquetan/desempaquetan a mano para no depender de

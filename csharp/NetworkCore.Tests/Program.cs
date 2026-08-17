@@ -41,7 +41,12 @@ Console.WriteLine("== Test 1: NetworkHost <-> NetworkClient (mecanismos genéric
     var inputsLock = new object();
     host.OnInput += input => { lock (inputsLock) receivedInputs.Add(input); };
 
-    host.Start(19999);
+    // Server posee el socket y multiplexa salas; la factory devuelve
+    // siempre el mismo host ya configurado arriba, así que el primer
+    // handshake (CreateRoom) crea UNA sala sobre ese host — igual que hacían
+    // los tests en Go (ver TestHandshakeInputSnapshotPing en host_test.go).
+    var server = new Server(() => host, new ServerOptions());
+    server.StartUdp(19999);
     Thread.Sleep(300);
 
     var client = new NetworkClient();
@@ -57,9 +62,13 @@ Console.WriteLine("== Test 1: NetworkHost <-> NetworkClient (mecanismos genéric
         }
     };
 
-    bool connected = client.Connect("127.0.0.1", 19999);
+    // Role es opaco para el core — acá se usa un valor arbitrario, sin
+    // ningún significado (mecanismo genérico, no hay esquema de juego).
+    const byte genericRole = 1;
+    bool connected = client.CreateRoom("127.0.0.1", 19999, genericRole);
     Check("handshake conecta", connected);
     Check("playerId asignado (>0)", client.PlayerId > 0);
+    Check("código de sala asignado", client.RoomCode.Length > 0);
 
     client.SendInput(deltaX: 15, deltaY: -7, rotation: 90, actions: 0);
     // Actions=0x99 es un valor arbitrario — el core no debe interpretarlo,
@@ -110,8 +119,18 @@ Console.WriteLine("== Test 1: NetworkHost <-> NetworkClient (mecanismos genéric
     while (DateTime.UtcNow < deadline && pong == null) Thread.Sleep(20);
     Check("ping/pong responde", pong != null);
 
+    // QueueReliableEvent: manda un evento crítico ya mismo (fuera del
+    // snapshot normal) y lo reintenta hasta que el cliente lo confirme — acá
+    // solo validamos que el cliente lo recibe y confirma automáticamente
+    // (ver NetworkClient.HandlePacket) y que la cola de retransmisión del
+    // host se vacía.
+    host.QueueReliableEvent(new GameEvent { PlayerId = client.PlayerId, EventType = 7, Data = new byte[] { 1 } });
+    deadline = DateTime.UtcNow.AddSeconds(2);
+    while (DateTime.UtcNow < deadline && host.PendingReliableCount(client.PlayerId) > 0) Thread.Sleep(20);
+    Check("evento reliable confirmado (cola de retransmisión vacía)", host.PendingReliableCount(client.PlayerId) == 0);
+
     client.Disconnect();
-    host.Stop();
+    server.Stop();
 }
 
 // ---------------------------------------------------------------------
@@ -123,11 +142,12 @@ Console.WriteLine();
 Console.WriteLine("== Test 2: heartbeat sobrevive >10s con actividad ==");
 {
     var host = new NetworkHost();
-    host.Start(19998);
+    var server = new Server(() => host, new ServerOptions());
+    server.StartUdp(19998);
     Thread.Sleep(300);
 
     var client = new NetworkClient();
-    client.Connect("127.0.0.1", 19998);
+    client.CreateRoom("127.0.0.1", 19998, role: 1);
 
     var start = DateTime.UtcNow;
     while ((DateTime.UtcNow - start).TotalSeconds < 12)
@@ -139,7 +159,7 @@ Console.WriteLine("== Test 2: heartbeat sobrevive >10s con actividad ==");
     Check("cliente sigue conectado en el host tras 12s", host.ConnectedPlayerCount == 1);
 
     client.Disconnect();
-    host.Stop();
+    server.Stop();
 }
 
 // ---------------------------------------------------------------------
@@ -153,7 +173,7 @@ Console.WriteLine();
 Console.WriteLine("== Test 3: NetworkClient (C#) <-> ejemplo taca-taca (Go real) ==");
 {
     string repoRoot = FindRepoRoot();
-    string serversDir = Path.Combine(repoRoot, "nucleo-multiplayer", "go", "ejemplo-tacataca");
+    string serversDir = Path.Combine(repoRoot, "go", "ejemplo-tacataca");
 
     var psi = new ProcessStartInfo
     {
@@ -173,9 +193,14 @@ Console.WriteLine("== Test 3: NetworkClient (C#) <-> ejemplo taca-taca (Go real)
         Thread.Sleep(2000); // esperar a que "go run" compile y levante el listener
 
         var client = new NetworkClient();
-        bool connected = client.Connect("127.0.0.1", 9999);
+        // Contra el ejemplo taca-taca real: un rol distinto de
+        // TacaTacaRoles.Paddle no recibe barra (ver taca-taca/main.go), así
+        // que usamos Paddle acá para que el server arranque el gameplay
+        // igual que con un mando real.
+        bool connected = client.CreateRoom("127.0.0.1", 9999, TacaTacaRoles.Paddle);
         Check("handshake contra Go real", connected);
         Check("playerId asignado por Go", client.PlayerId > 0);
+        Check("código de sala asignado por Go", client.RoomCode.Length > 0);
 
         client.SendPing();
         int? pong = null;
@@ -218,11 +243,12 @@ Console.WriteLine("== Test 4: ejemplo taca-taca sobre el core genérico ==");
     var host = new NetworkHost();
     var game = new TacaTacaGame();
     game.AttachTo(host);
-    host.Start(19997);
+    var server = new Server(() => host, new ServerOptions());
+    server.StartUdp(19997);
     Thread.Sleep(300);
 
     var client = new NetworkClient();
-    bool connected = client.Connect("127.0.0.1", 19997);
+    bool connected = client.CreateRoom("127.0.0.1", 19997, TacaTacaRoles.Paddle);
     Check("handshake conecta (taca-taca)", connected);
 
     // Mover la barra propia.
@@ -256,7 +282,7 @@ Console.WriteLine("== Test 4: ejemplo taca-taca sobre el core genérico ==");
     }
 
     client.Disconnect();
-    host.Stop();
+    server.Stop();
 }
 
 Console.WriteLine();
@@ -274,11 +300,11 @@ else
 static string FindRepoRoot()
 {
     var dir = new DirectoryInfo(AppContext.BaseDirectory);
-    while (dir != null && !Directory.Exists(Path.Combine(dir.FullName, "implementaciones")))
+    while (dir != null && !Directory.Exists(Path.Combine(dir.FullName, "go", "networkcore")))
         dir = dir.Parent;
 
     if (dir == null)
-        throw new DirectoryNotFoundException("No se encontró la raíz del repo (carpeta 'implementaciones') subiendo desde " + AppContext.BaseDirectory);
+        throw new DirectoryNotFoundException("No se encontró la raíz del repo (carpeta 'go/networkcore') subiendo desde " + AppContext.BaseDirectory);
 
     return dir.FullName;
 }

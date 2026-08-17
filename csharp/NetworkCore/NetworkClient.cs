@@ -26,22 +26,49 @@ namespace NetworkCore
         private readonly object _reliableLock = new();
 
         public ushort PlayerId { get; private set; }
+        // Código de la sala asignada por el server (tanto al crearla como al
+        // unirse) — esto es lo que un cliente con rol "tablero" necesita
+        // mostrar/codificar en un QR para que otros clientes se unan.
+        public string RoomCode { get; private set; } = "";
         public bool Connected { get; private set; }
         public int LastPingMs { get; private set; }
         public GameSnapshot? LatestSnapshot { get; private set; }
+        // Motivo del último rechazo de handshake (PacketDisconnect) — válido
+        // solo cuando CreateRoom/JoinRoom devuelve false por un rechazo
+        // explícito del server (ver DisconnectReason).
+        public byte? LastDisconnectReason { get; private set; }
 
         public event Action<GameSnapshot>? OnSnapshot;
         public event Action<int>? OnPong; // ms de RTT
 
+        // CreateRoom pide al server que arranque una sala nueva. Role es
+        // opaco para el core — cada juego define sus propios valores y su
+        // significado (ver DisconnectReason/HandshakeMode en Protocol.cs).
+        public bool CreateRoom(string host, int port, byte role, int timeoutMs = 3000)
+            => Connect(host, port, HandshakeMode.Create, role, "", timeoutMs);
+
+        // JoinRoom se une a una sala existente por código (el que devolvió
+        // CreateRoom en otro cliente).
+        public bool JoinRoom(string host, int port, byte role, string roomCode, int timeoutMs = 3000)
+            => Connect(host, port, HandshakeMode.Join, role, roomCode, timeoutMs);
+
         // Handshake bloqueante con timeout — simple y suficiente para
-        // conectar contra el host al arrancar. No corre en background.
-        public bool Connect(string host, int port, int timeoutMs = 3000)
+        // conectar contra el server al arrancar. No corre en background.
+        // Si el server rechaza el handshake (PacketDisconnect — sala
+        // inexistente o llena) devuelve false sin lanzar, con el motivo en
+        // LastDisconnectReason. Si el handshake ya se había mandado antes y
+        // el ack se perdió, el server reenvía el mismo ack (mismo
+        // PlayerId/RoomCode) — no hace falta ningún manejo especial acá.
+        private bool Connect(string host, int port, byte mode, byte role, string roomCode, int timeoutMs)
         {
+            LastDisconnectReason = null;
+
             _udp = new UdpClient();
             _udp.Client.ReceiveTimeout = timeoutMs;
             _serverEndPoint = new IPEndPoint(IPAddress.Parse(host), port);
 
-            var handshake = PacketHeader.Build(0, 0, PacketType.Handshake);
+            var payload = JoinPayload.Encode(mode, role, roomCode);
+            var handshake = Concat(PacketHeader.Build(0, 0, PacketType.Handshake), payload);
             _udp.Send(handshake, handshake.Length, _serverEndPoint);
 
             IPEndPoint remote = new IPEndPoint(IPAddress.Any, 0);
@@ -55,12 +82,23 @@ namespace NetworkCore
                 return false;
             }
 
-            if (!PacketHeader.TryParse(response, out _, out _, out byte type, out _) || type != PacketType.Handshake)
-                return false;
-            if (response.Length < 11)
+            if (!PacketHeader.TryParse(response, out _, out _, out byte type, out _))
                 return false;
 
-            PlayerId = BigEndian.ReadUInt16(response, 9);
+            if (type == PacketType.Disconnect)
+            {
+                LastDisconnectReason = response.Length > PacketHeader.Size ? response[PacketHeader.Size] : (byte)0;
+                return false;
+            }
+
+            if (type != PacketType.Handshake) return false;
+
+            var ackPayload = SubArray(response, PacketHeader.Size);
+            if (!HandshakeAck.TryDecode(ackPayload, out ushort playerId, out string assignedRoomCode))
+                return false;
+
+            PlayerId = playerId;
+            RoomCode = assignedRoomCode;
             Connected = true;
             _running = true;
 
@@ -146,7 +184,7 @@ namespace NetworkCore
 
         private void HandlePacket(byte[] data)
         {
-            if (!PacketHeader.TryParse(data, out uint seq, out _, out byte type, out _))
+            if (!PacketHeader.TryParse(data, out uint seq, out _, out byte type, out byte flags))
                 return;
 
             switch (type)
@@ -164,6 +202,24 @@ namespace NetworkCore
                     {
                         LatestSnapshot = snapshot;
                         OnSnapshot?.Invoke(snapshot!);
+                    }
+
+                    // Un snapshot marcado FlagReliable es un evento crítico
+                    // que el host (ver NetworkHost.QueueReliableEvent) va a
+                    // seguir retransmitiendo hasta que lo confirmemos. La
+                    // convención de este protocolo para confirmar un paquete
+                    // puntual (no el heartbeat normal de input reliable) es
+                    // mandar un PacketAck cuyos campos seq Y ack sean AMBOS
+                    // el seq del paquete recibido (ver SendAck en
+                    // NetworkHost). El evento puede además llegar de nuevo
+                    // en el próximo snapshot normal — entrega "al menos una
+                    // vez", así que esto es solo la confirmación de
+                    // recepción, no algo que el juego deba tratar como
+                    // exactamente-una-vez.
+                    if ((flags & PacketFlag.Reliable) != 0)
+                    {
+                        var ackPacket = PacketHeader.Build(seq, seq, PacketType.Ack);
+                        SendRaw(ackPacket);
                     }
                     break;
 
@@ -214,6 +270,14 @@ namespace NetworkCore
             var result = new byte[a.Length + b.Length];
             Array.Copy(a, 0, result, 0, a.Length);
             Array.Copy(b, 0, result, a.Length, b.Length);
+            return result;
+        }
+
+        private static byte[] SubArray(byte[] data, int offset)
+        {
+            if (offset >= data.Length) return Array.Empty<byte>();
+            var result = new byte[data.Length - offset];
+            Array.Copy(data, offset, result, 0, result.Length);
             return result;
         }
 

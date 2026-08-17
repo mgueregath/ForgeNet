@@ -1,12 +1,21 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
-using System.Net;
-using System.Net.Sockets;
 using System.Threading;
 
 namespace NetworkCore
 {
+    // Peer es la identidad de un cliente a nivel transporte — hoy solo UDP
+    // crudo (ver UdpPeer en Server.cs), pero la abstracción existe para que
+    // NetworkHost nunca dependa de un socket concreto: cualquier cosa que
+    // pueda mandar bytes y tenga una clave estable (Key()) sirve. Espejo de
+    // la interfaz Peer en go/networkcore/host.go.
+    public interface IPeer
+    {
+        void Send(byte[] data);
+        string Key();
+    }
+
     // Rol "servidor" del protocolo. Es una clase C# plana (sin MonoBehaviour,
     // sin dependencias de UnityEngine) para poder correr en dos contextos:
     //  - Embebido dentro de un cliente Unity que también renderiza (modalidad
@@ -14,14 +23,22 @@ namespace NetworkCore
     //  - Un futuro build headless de Unity ("Dedicated Server" build target)
     //    si algún juego necesitara la topología clásica en C# en vez de Go.
     //
-    // Genérico por diseño: NetworkHost solo maneja sesión/conexión/transporte
-    // (handshake, heartbeat, reliable, ping, tick loop) — NO sabe nada sobre
-    // el juego en sí (no hay "Health", "Ammo", "Ball" ni nada específico acá).
-    // El juego que lo use se engancha vía OnInput/OnTick/StateProvider.
+    // Genérico por diseño: NetworkHost solo maneja sesión/conexión (handshake
+    // de admisión, heartbeat, reliable, ping, tick loop) para UNA sala/
+    // partida — NO sabe nada sobre el juego en sí (no hay "Health", "Ammo",
+    // "Ball" ni nada específico acá), y tampoco sabe de qué transporte vienen
+    // los paquetes ni a qué sala pertenece: eso lo decide Server, que crea
+    // una instancia de NetworkHost por sala y le rutea sus paquetes (ver
+    // Server.cs). El juego que use NetworkHost se engancha vía OnInput/
+    // OnTick/StateProvider.
     public class ClientConnection
     {
         public ushort PlayerId;
-        public IPEndPoint EndPoint = null!;
+        public IPeer Peer = null!;
+        // Role es opaco: el core lo guarda y lo expone (ver
+        // NetworkHost.GetClientRole) pero nunca lo interpreta — cada juego
+        // define sus propios valores y qué significan.
+        public byte Role;
         public uint LastSeq;
         public DateTime LastHeartbeat;
         public int Ping;
@@ -40,17 +57,16 @@ namespace NetworkCore
 
     public class NetworkHost : IDisposable
     {
-        public const int MaxPlayers = 64;
         private static readonly TimeSpan TickRate = TimeSpan.FromMilliseconds(16); // 60Hz, igual que server.go
         private static readonly TimeSpan RetryInterval = TimeSpan.FromMilliseconds(100);
         private static readonly TimeSpan HeartbeatInterval = TimeSpan.FromSeconds(1);
         private static readonly TimeSpan HeartbeatTimeout = TimeSpan.FromSeconds(10);
         private const int MaxRetries = 3;
 
-        private UdpClient? _udp;
         private volatile bool _running;
+        private int _started; // 0/1 usado con Interlocked, equivalente a sync.Once en host.go
 
-        private readonly Dictionary<IPEndPoint, ClientConnection> _clientsByEndPoint = new();
+        private readonly Dictionary<string, ClientConnection> _clientsByKey = new(); // key = Peer.Key()
         private readonly Dictionary<ushort, ClientConnection> _clientsById = new();
         private readonly object _clientsLock = new();
 
@@ -67,8 +83,11 @@ namespace NetworkCore
 
         // --- Hooks genéricos: acá es donde el juego se engancha ---
 
-        // Se dispara cuando un jugador nuevo termina el handshake.
-        public event Action<ushort>? OnPlayerConnected;
+        // Se dispara cuando un jugador nuevo termina el handshake (ver
+        // AdmitPlayer). Role es opaco para el core — cada juego define sus
+        // propios valores y qué hacer con ellos (ej. no crear una "barra" de
+        // juego para el rol que representa al tablero).
+        public event Action<ushort, byte>? OnPlayerConnected;
         // Se dispara cuando un jugador se desconecta (timeout de heartbeat).
         public event Action<ushort>? OnPlayerDisconnected;
         // Se dispara para cada input recibido, en orden, dentro del tick loop.
@@ -81,135 +100,183 @@ namespace NetworkCore
         // snapshot. Si es null, se manda un StatePayload vacío.
         public Func<byte[]>? StateProvider;
 
-        public void Start(int port)
+        // Start arranca el tick loop, la retransmisión de confiables y el
+        // heartbeat de esta sala. La llama Server exactamente una vez, al
+        // crear la sala (ver Server.CreateRoom) — el chequeo con
+        // Interlocked es solo una salvaguarda, análogo a sync.Once en
+        // host.go. NetworkHost ya NO liga ningún socket: eso es
+        // responsabilidad de Server, que es quien lo posee.
+        internal void Start()
         {
-            _udp = new UdpClient(port);
-            _udp.Client.ReceiveBufferSize = 1 << 20;
-            _udp.Client.SendBufferSize = 1 << 20;
-            // Timeout corto en vez de bloqueo indefinido: en algunas
-            // plataformas UdpClient.Close() no interrumpe de forma fiable un
-            // Receive() síncrono bloqueado en otro thread (puede colgar
-            // Stop() esperando a que ese thread termine). Con esto el loop
-            // se despierta solo cada 500ms a chequear _running.
-            _udp.Client.ReceiveTimeout = 500;
-            _running = true;
+            if (Interlocked.Exchange(ref _started, 1) != 0) return;
 
-            new Thread(ReceiveLoop) { IsBackground = true, Name = "NetworkHost.Receive" }.Start();
+            _running = true;
             new Thread(GameLoop) { IsBackground = true, Name = "NetworkHost.Tick" }.Start();
             new Thread(SendLoop) { IsBackground = true, Name = "NetworkHost.Send" }.Start();
             new Thread(HeartbeatLoop) { IsBackground = true, Name = "NetworkHost.Heartbeat" }.Start();
         }
 
+        // Stop detiene los loops de fondo de esta sala (tick, retransmisión,
+        // heartbeat). No toca ningún transporte — eso es responsabilidad de
+        // Server, que es quien los posee.
         public void Stop()
         {
             _running = false;
-            _udp?.Close();
         }
 
         public void Dispose() => Stop();
 
         // El juego puede encolar eventos propios (ej. GOAL) para que salgan
-        // en el próximo snapshot, además de los que dispara el propio core
-        // (hoy el core no genera ninguno automáticamente — antes lo hacía
-        // como parte de la lógica de "Fire" del prototipo shooter, ahora esa
-        // decisión es 100% del juego).
+        // en el próximo snapshot. Entrega "mejor esfuerzo": si el paquete se
+        // pierde, el evento no vuelve a mandarse. Para eventos que el juego
+        // no puede permitirse perder ver QueueReliableEvent.
         public void QueueEvent(GameEvent evt)
         {
             lock (_eventsLock) _pendingEvents.Add(evt);
         }
 
-        // --- Recepción ---
-
-        private void ReceiveLoop()
+        // QueueReliableEvent hace lo mismo que QueueEvent (el evento sale en
+        // el próximo snapshot de todos modos) pero además lo manda ya mismo,
+        // a cada cliente conectado, como un paquete aparte marcado
+        // PacketFlag.Reliable — el core lo reintenta (mismo mecanismo que ya
+        // existía para reliable input, ver SendLoop) hasta que el cliente lo
+        // confirma con PacketAck o se agotan los reintentos. Pensado para
+        // eventos que el juego no puede permitirse perder en una red con
+        // pérdida real (ej. GOAL en un server público).
+        //
+        // La entrega es "al menos una vez", no "exactamente una vez": el
+        // cliente puede recibir el mismo evento acá y de nuevo en el
+        // snapshot normal — el juego debe tratarlo como una notificación
+        // idempotente (ej. "hubo un gol, resincronizá con StatePayload"), no
+        // como algo que suma un contador él mismo.
+        public void QueueReliableEvent(GameEvent evt)
         {
-            var anyEndPoint = new IPEndPoint(IPAddress.Any, 0);
-            while (_running)
-            {
-                byte[] data;
-                IPEndPoint remote;
-                try
-                {
-                    data = _udp!.Receive(ref anyEndPoint);
-                    remote = new IPEndPoint(anyEndPoint.Address, anyEndPoint.Port);
-                }
-                catch (SocketException)
-                {
-                    if (!_running) return;
-                    continue;
-                }
-                catch (ObjectDisposedException)
-                {
-                    return;
-                }
+            QueueEvent(evt);
 
-                HandlePacket(data, remote);
+            var snap = new GameSnapshot
+            {
+                Tick = _tick,
+                Timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                Events = new List<GameEvent> { evt }
+            };
+            var payload = snap.Encode();
+
+            List<ClientConnection> clients;
+            lock (_clientsLock) clients = new List<ClientConnection>(_clientsById.Values);
+
+            foreach (var client in clients)
+            {
+                uint seq = NextSeqNumber();
+                var header = PacketHeader.Build(seq, 0, PacketType.Snapshot, PacketFlag.Reliable);
+                var packet = Concat(header, payload);
+
+                lock (client.QueueLock)
+                    client.ReliableQueue.Add(new ReliableMessage { Seq = seq, Data = packet, Sent = DateTime.UtcNow });
+
+                client.Peer.Send(packet);
             }
         }
 
-        private void HandlePacket(byte[] data, IPEndPoint addr)
+        // PendingReliableCount: cuántos paquetes reliable (ver
+        // QueueReliableEvent) todavía no fueron confirmados por este
+        // cliente. Diagnóstico genérico — útil para cualquier juego que
+        // quiera saber si un cliente se está quedando atrás, no es
+        // específico de ningún evento en particular.
+        public int PendingReliableCount(ushort playerId)
+        {
+            ClientConnection? client;
+            lock (_clientsLock) _clientsById.TryGetValue(playerId, out client);
+            if (client == null) return 0;
+
+            lock (client.QueueLock) return client.ReliableQueue.Count;
+        }
+
+        public int ConnectedPlayerCount
+        {
+            get { lock (_clientsLock) return _clientsById.Count; }
+        }
+
+        // --- Recepción: punto de entrada común para cualquier transporte ---
+
+        // HandlePacket procesa un paquete crudo recibido de un Peer que YA
+        // pertenece a esta sala. El handshake no pasa por acá: es Server
+        // quien lo intercepta primero para decidir a qué sala corresponde
+        // (crear una nueva o unirse a una existente) y recién ahí llama a
+        // AdmitPlayer — ver Server.cs.
+        public void HandlePacket(byte[] data, IPeer peer)
         {
             if (!PacketHeader.TryParse(data, out uint seq, out _, out byte type, out byte flags))
                 return;
 
             switch (type)
             {
-                case PacketType.Handshake:
-                    HandleHandshake(seq, addr);
-                    break;
                 case PacketType.Input:
-                    HandleInput(seq, addr, flags, SubArray(data, PacketHeader.Size));
+                    HandleInput(seq, peer, flags, SubArray(data, PacketHeader.Size));
                     break;
                 case PacketType.Ack:
-                    HandleAck(seq, addr);
+                    HandleAck(seq, peer);
                     break;
                 case PacketType.Ping:
-                    HandlePing(seq, addr, SubArray(data, PacketHeader.Size));
+                    HandlePing(seq, peer, SubArray(data, PacketHeader.Size));
                     break;
             }
         }
 
-        private static byte[] SubArray(byte[] data, int offset)
+        // AdmitPlayer registra un cliente nuevo en esta sala y dispara
+        // OnPlayerConnected(playerId, role). La llama Server, después de
+        // decidir (crear/unirse) a qué sala pertenece el cliente. Role es
+        // opaco para el core — cada juego define sus propios valores y qué
+        // hacer con ellos (ej. no crear una "barra" de juego para el rol que
+        // representa al tablero). Idempotente: un cliente que ya está
+        // admitido devuelve su PlayerId actual sin duplicar estado (cubre el
+        // reintento de un handshake cuyo ack se perdió).
+        public ushort AdmitPlayer(IPeer peer, byte role)
         {
-            if (offset >= data.Length) return Array.Empty<byte>();
-            var result = new byte[data.Length - offset];
-            Array.Copy(data, offset, result, 0, result.Length);
-            return result;
-        }
-
-        private void HandleHandshake(uint seq, IPEndPoint addr)
-        {
+            string key = peer.Key();
             ushort playerId;
+
             lock (_clientsLock)
             {
-                if (_clientsByEndPoint.ContainsKey(addr))
-                    return;
+                if (_clientsByKey.TryGetValue(key, out var existing))
+                    return existing.PlayerId;
 
                 playerId = _nextPlayerId++;
                 var client = new ClientConnection
                 {
                     PlayerId = playerId,
-                    EndPoint = addr,
-                    LastSeq = seq,
+                    Peer = peer,
+                    Role = role,
                     LastHeartbeat = DateTime.UtcNow,
                     Connected = true
                 };
-                _clientsByEndPoint[addr] = client;
                 _clientsById[playerId] = client;
+                _clientsByKey[key] = client;
             }
 
-            var response = new byte[11];
-            BigEndian.WriteUInt32(response, 0, seq);
-            BigEndian.WriteUInt32(response, 4, 0);
-            response[8] = PacketType.Handshake;
-            BigEndian.WriteUInt16(response, 9, playerId);
-            SendTo(response, addr);
-
-            OnPlayerConnected?.Invoke(playerId);
+            OnPlayerConnected?.Invoke(playerId, role);
+            return playerId;
         }
 
-        private void HandleInput(uint seq, IPEndPoint addr, byte flags, byte[] payload)
+        // GetClientRole devuelve el rol opaco con el que se admitió a un
+        // jugador (ver AdmitPlayer). Devuelve false si el jugador no existe
+        // (ya desconectado, o ID inválido).
+        public bool GetClientRole(ushort playerId, out byte role)
         {
-            var client = FindClientByEndPoint(addr);
+            lock (_clientsLock)
+            {
+                if (_clientsById.TryGetValue(playerId, out var client))
+                {
+                    role = client.Role;
+                    return true;
+                }
+            }
+            role = 0;
+            return false;
+        }
+
+        private void HandleInput(uint seq, IPeer peer, byte flags, byte[] payload)
+        {
+            var client = FindClientByKey(peer.Key());
             if (client == null) return;
             if (!PlayerInput.TryDecodePayload(payload, out short dx, out short dy, out ushort rot, out uint actions))
                 return;
@@ -235,9 +302,9 @@ namespace NetworkCore
             client.LastHeartbeat = DateTime.UtcNow;
         }
 
-        private void HandleAck(uint seq, IPEndPoint addr)
+        private void HandleAck(uint seq, IPeer peer)
         {
-            var client = FindClientByEndPoint(addr);
+            var client = FindClientByKey(peer.Key());
             if (client == null) return;
 
             client.LastHeartbeat = DateTime.UtcNow;
@@ -248,9 +315,9 @@ namespace NetworkCore
             }
         }
 
-        private void HandlePing(uint seq, IPEndPoint addr, byte[] payload)
+        private void HandlePing(uint seq, IPeer peer, byte[] payload)
         {
-            var client = FindClientByEndPoint(addr);
+            var client = FindClientByKey(peer.Key());
             if (client == null) return;
             if (payload.Length < 8) return;
 
@@ -265,7 +332,7 @@ namespace NetworkCore
             BigEndian.WriteUInt32(response, 4, 0);
             response[8] = PacketType.Ping;
             BigEndian.WriteInt64(response, 9, serverTime);
-            SendTo(response, addr);
+            peer.Send(response);
         }
 
         private void SendAck(ClientConnection client, uint seq)
@@ -274,7 +341,7 @@ namespace NetworkCore
             BigEndian.WriteUInt32(response, 0, seq);
             BigEndian.WriteUInt32(response, 4, seq);
             response[8] = PacketType.Ack;
-            SendTo(response, client.EndPoint);
+            client.Peer.Send(response);
         }
 
         // --- Tick de juego ---
@@ -328,17 +395,13 @@ namespace NetworkCore
             lock (_clientsLock)
                 clients = new List<ClientConnection>(_clientsById.Values);
 
+            var header = PacketHeader.Build(seq, 0, PacketType.Snapshot);
+            var packet = Concat(header, payload);
+
             foreach (var client in clients)
             {
                 if (!client.Connected) continue;
-
-                var packet = new byte[payload.Length + PacketHeader.Size];
-                BigEndian.WriteUInt32(packet, 0, seq);
-                BigEndian.WriteUInt32(packet, 4, 0);
-                packet[8] = PacketType.Snapshot;
-                Array.Copy(payload, 0, packet, PacketHeader.Size, payload.Length);
-
-                SendTo(packet, client.EndPoint);
+                client.Peer.Send(packet);
             }
         }
 
@@ -364,7 +427,7 @@ namespace NetworkCore
                         {
                             if (now - msg.Sent > RetryInterval && msg.Retries < MaxRetries)
                             {
-                                SendTo(msg.Data, client.EndPoint);
+                                client.Peer.Send(msg.Data);
                                 msg.Sent = now;
                                 msg.Retries++;
                             }
@@ -399,7 +462,7 @@ namespace NetworkCore
                         var client = _clientsById[id];
                         client.Connected = false;
                         _clientsById.Remove(id);
-                        _clientsByEndPoint.Remove(client.EndPoint);
+                        _clientsByKey.Remove(client.Peer.Key());
                     }
                 }
 
@@ -410,10 +473,10 @@ namespace NetworkCore
 
         // --- Helpers ---
 
-        private ClientConnection? FindClientByEndPoint(IPEndPoint addr)
+        private ClientConnection? FindClientByKey(string key)
         {
             lock (_clientsLock)
-                return _clientsByEndPoint.TryGetValue(addr, out var c) ? c : null;
+                return _clientsByKey.TryGetValue(key, out var c) ? c : null;
         }
 
         private uint NextSeqNumber()
@@ -421,16 +484,20 @@ namespace NetworkCore
             lock (_seqLock) return ++_sequenceCounter;
         }
 
-        private void SendTo(byte[] data, IPEndPoint addr)
+        private static byte[] SubArray(byte[] data, int offset)
         {
-            try { _udp?.Send(data, data.Length, addr); }
-            catch (ObjectDisposedException) { /* servidor detenido durante el envío */ }
-            catch (SocketException) { /* paquete perdido, esperable en UDP */ }
+            if (offset >= data.Length) return Array.Empty<byte>();
+            var result = new byte[data.Length - offset];
+            Array.Copy(data, offset, result, 0, result.Length);
+            return result;
         }
 
-        public int ConnectedPlayerCount
+        private static byte[] Concat(byte[] a, byte[] b)
         {
-            get { lock (_clientsLock) return _clientsById.Count; }
+            var result = new byte[a.Length + b.Length];
+            Array.Copy(a, 0, result, 0, a.Length);
+            Array.Copy(b, 0, result, a.Length, b.Length);
+            return result;
         }
     }
 }

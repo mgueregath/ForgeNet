@@ -15,6 +15,16 @@ namespace NetworkCore.Tests
         Goal = 1,
     }
 
+    // Roles de taca-taca — opacos para el core, definidos y usados solo acá.
+    // RoleBoard es el tablero (recibe el mismo snapshot que todos, pero no
+    // controla ninguna barra); RolePaddle es un mando/jugador. Análogo a
+    // roleBoard/rolePaddle en go/ejemplo-tacataca/main.go.
+    public static class TacaTacaRoles
+    {
+        public const byte Board = 0x01;
+        public const byte Paddle = 0x02;
+    }
+
     public class RodState
     {
         public ushort PlayerId;
@@ -92,14 +102,30 @@ namespace NetworkCore.Tests
     // NetworkHost no conoce esta clase — es este lado el que se suscribe.
     public class TacaTacaGame
     {
+        // Cupo de mandos por partida — regla de taca-taca, no del core
+        // (NetworkHost/Server no distinguen roles, así que un límite que
+        // dependa del rol es responsabilidad del juego, no de acá).
+        private const int MaxPaddles = 2;
+
         private readonly TacaTacaState _state = new TacaTacaState();
         private readonly object _lock = new object();
 
         public void AttachTo(NetworkHost host)
         {
-            host.OnPlayerConnected += id =>
+            // Role es opaco para el core: acá es donde taca-taca decide qué
+            // hacer con cada valor. El tablero (TacaTacaRoles.Board) recibe
+            // el mismo snapshot que todos (ve la partida completa) pero no
+            // controla ninguna barra. Un mando (TacaTacaRoles.Paddle) más
+            // allá del cupo tampoco recibe barra — se queda conectado, pero
+            // sin efecto en el juego.
+            host.OnPlayerConnected += (id, role) =>
             {
-                lock (_lock) _state.Rods.Add(new RodState { PlayerId = id, Position = 0, Rotation = 0 });
+                if (role != TacaTacaRoles.Paddle) return;
+                lock (_lock)
+                {
+                    if (_state.Rods.Count >= MaxPaddles) return;
+                    _state.Rods.Add(new RodState { PlayerId = id, Position = 0, Rotation = 0 });
+                }
             };
             host.OnPlayerDisconnected += id =>
             {
