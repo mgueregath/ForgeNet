@@ -145,10 +145,31 @@ func (c *testClient) sendPing(t *testing.T) {
 	}
 }
 
+// sendAck confirma un paquete reliable del server. El campo "seq" del
+// header de un PacketAck es, por convención de este protocolo, el número
+// de secuencia que se está confirmando (ver NetworkHost.sendAck y
+// handleAck) — no un seq propio del cliente.
+func (c *testClient) sendAck(t *testing.T, ackedSeq uint32) {
+	t.Helper()
+	packet := buildHeader(ackedSeq, ackedSeq, PacketAck, 0)
+	if _, err := c.conn.Write(packet); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // readUntil lee paquetes hasta que match devuelva true o se cumpla el
 // deadline, descartando lo que no matchea (para no bloquear el test con
 // paquetes de otro tipo mezclados en el flujo).
 func (c *testClient) readUntil(t *testing.T, timeout time.Duration, match func(packetType byte, payload []byte) bool) []byte {
+	t.Helper()
+	_, payload := c.readUntilWithSeq(t, timeout, match)
+	return payload
+}
+
+// readUntilWithSeq es igual que readUntil, pero también devuelve el campo
+// seq del header — hace falta para poder ackear un paquete reliable
+// puntual (ver sendAck) en vez de solo inspeccionar su payload.
+func (c *testClient) readUntilWithSeq(t *testing.T, timeout time.Duration, match func(packetType byte, payload []byte) bool) (seq uint32, payload []byte) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	buf := make([]byte, 4096)
@@ -158,16 +179,16 @@ func (c *testClient) readUntil(t *testing.T, timeout time.Duration, match func(p
 		if err != nil {
 			continue
 		}
-		_, _, packetType, _, ok := parseHeader(buf[:n])
+		pktSeq, _, packetType, _, ok := parseHeader(buf[:n])
 		if !ok {
 			continue
 		}
-		payload := append([]byte{}, buf[HeaderSize:n]...)
-		if match(packetType, payload) {
-			return payload
+		p := append([]byte{}, buf[HeaderSize:n]...)
+		if match(packetType, p) {
+			return pktSeq, p
 		}
 	}
-	return nil
+	return 0, nil
 }
 
 func TestHandshakeInputSnapshotPing(t *testing.T) {
@@ -417,4 +438,55 @@ func TestRoleIsOpaqueButExposed(t *testing.T) {
 	if role, ok := host.GetClientRole(clientA.playerID); !ok || role != roleA {
 		t.Errorf("GetClientRole(A) = %d, %v — want %d, true", role, ok, roleA)
 	}
+}
+
+// TestQueueReliableEventRetransmitsUntilAcked: un evento reliable llega,
+// se retransmite mientras el cliente no lo confirme, y deja de retransmitir
+// (la cola queda vacía) apenas el cliente manda el ack.
+func TestQueueReliableEventRetransmitsUntilAcked(t *testing.T) {
+	host := NewNetworkHost()
+	server := NewServer(func() *NetworkHost { return host }, ServerOptions{})
+	if err := server.StartUDP(29993); err != nil {
+		t.Fatal(err)
+	}
+	defer server.Stop()
+	time.Sleep(200 * time.Millisecond)
+
+	client := newTestClient(t, 29993)
+	client.handshake(t, 1)
+
+	host.QueueReliableEvent(GameEvent{PlayerID: client.playerID, EventType: 9, Data: []byte{7}})
+
+	isTargetEvent := func(pt byte, payload []byte) bool {
+		if pt != PacketSnapshot {
+			return false
+		}
+		s, err := DecodeSnapshot(payload)
+		return err == nil && len(s.Events) == 1 && s.Events[0].EventType == 9
+	}
+
+	seq, payload := client.readUntilWithSeq(t, 1*time.Second, isTargetEvent)
+	if payload == nil {
+		t.Fatal("no llegó el evento reliable")
+	}
+
+	if host.PendingReliableCount(client.playerID) == 0 {
+		t.Fatal("el evento reliable no quedó en la cola de retransmisión")
+	}
+
+	// retryInterval es 100ms — sin ackear, debería seguir llegando.
+	if _, retried := client.readUntilWithSeq(t, 500*time.Millisecond, isTargetEvent); retried == nil {
+		t.Fatal("el evento reliable no se retransmitió sin ack")
+	}
+
+	client.sendAck(t, seq)
+
+	deadline := time.Now().Add(1 * time.Second)
+	for time.Now().Before(deadline) {
+		if host.PendingReliableCount(client.playerID) == 0 {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("la cola de retransmisión no se vació después del ack")
 }

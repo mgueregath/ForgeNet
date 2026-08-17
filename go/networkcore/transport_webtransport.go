@@ -44,10 +44,30 @@ type WebTransportOptions struct {
 	// Path del endpoint WebTransport, ej. "/webtransport". Default: "/webtransport".
 	Path string
 	// TLSConfig propio (para producción, con un certificado real de una
-	// CA). Si es nil, se genera un certificado self-signed de desarrollo
-	// automáticamente (ver GenerateDevCertificate) — NO usar eso en
-	// producción.
+	// CA — ver LoadTLSCertificate). Si es nil, se genera un certificado
+	// self-signed de desarrollo automáticamente (ver GenerateDevCertificate)
+	// — NO usar eso en producción.
 	TLSConfig *tls.Config
+	// AllowedOrigins: orígenes (ej. "https://miapp.com") desde los que se
+	// acepta la conexión WebTransport. Vacío (default) acepta cualquier
+	// origen — cómodo para desarrollo, pero en producción cualquier página
+	// podría abrir una sesión contra este server; hay que restringirlo al
+	// dominio real donde vive el cliente.
+	AllowedOrigins []string
+}
+
+// LoadTLSCertificate carga un certificado real (de una CA — ej. Let's
+// Encrypt vía ACME/Certbot corriendo aparte) desde un par de archivos PEM,
+// para usar en WebTransportOptions.TLSConfig en producción. El certificado
+// self-signed que genera GenerateDevCertificate solo lo acepta un browser
+// vía el pinning de serverCertificateHashes — no sirve como reemplazo de
+// un certificado de CA real de cara al público.
+func LoadTLSCertificate(certFile, keyFile string) (*tls.Config, error) {
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		return nil, fmt.Errorf("cargando certificado TLS: %w", err)
+	}
+	return &tls.Config{Certificates: []tls.Certificate{cert}}, nil
 }
 
 // DevCertificate es el resultado de generar un certificado de desarrollo:
@@ -113,6 +133,23 @@ func GenerateDevCertificate() (*DevCertificate, error) {
 	}, nil
 }
 
+// buildOriginChecker: sin orígenes configurados, acepta cualquiera (default
+// cómodo para desarrollo). Con la lista seteada, exige coincidencia exacta
+// contra el header Origin — es responsabilidad de quien despliega en
+// producción pasar AllowedOrigins con el dominio real.
+func buildOriginChecker(allowed []string) func(*http.Request) bool {
+	if len(allowed) == 0 {
+		return func(*http.Request) bool { return true }
+	}
+	allowedSet := make(map[string]bool, len(allowed))
+	for _, origin := range allowed {
+		allowedSet[origin] = true
+	}
+	return func(r *http.Request) bool {
+		return allowedSet[r.Header.Get("Origin")]
+	}
+}
+
 // StartWebTransport arranca un listener WebTransport (QUIC/HTTP-3) además
 // de (o en vez de) StartUDP — se pueden usar los dos a la vez en el mismo
 // Server: un cliente Unity (UDP) y un cliente de navegador (WebTransport)
@@ -148,10 +185,8 @@ func (s *Server) StartWebTransport(opts WebTransportOptions) (*DevCertificate, e
 	}
 
 	wtServer := &webtransport.Server{
-		H3: h3Server,
-		// Dev: aceptar cualquier origen. En producción esto debería
-		// restringirse al dominio real donde vive la página.
-		CheckOrigin: func(*http.Request) bool { return true },
+		H3:          h3Server,
+		CheckOrigin: buildOriginChecker(opts.AllowedOrigins),
 	}
 	webtransport.ConfigureHTTP3Server(h3Server)
 

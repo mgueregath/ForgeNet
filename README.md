@@ -86,12 +86,35 @@ cd ../go/ejemplo-tacataca && go run .   # then open http://localhost:8080/
 
 Full per-language detail (test counts, design notes, known caveats) lives inline in each folder; see `csharp/`, `go/`, etc.
 
+## Running `go/networkcore` as an online server
+
+`Server` (in `go/networkcore/server.go`) is meant to run continuously and host many concurrent matches — this is what backs `ejemplo-tacataca`. Configuration is by environment variable, so the same binary runs unmodified in a container:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `UDP_PORT` | `9999` | Raw UDP listener port |
+| `WEBTRANSPORT_ADDR` | `:9443` | WebTransport/QUIC listener address |
+| `HTTP_ADDR` | `:8080` | Serves the browser test page + `/certhash` |
+| `WEB_DIR` | `../../web` | Static files for the browser page; skipped (server still runs) if the path doesn't exist |
+| `TLS_CERT_FILE` / `TLS_KEY_FILE` | unset | A real CA certificate (e.g. from Let's Encrypt/Certbot run separately) for WebTransport. Unset falls back to the self-signed dev certificate (`GenerateDevCertificate`), which is fine for local testing but not for production — browsers only accept it via the `serverCertificateHashes` pinning dance, not as a trusted CA |
+| `ALLOWED_ORIGINS` | unset (any) | Comma-separated origins allowed to open a WebTransport session. Leaving this unset accepts any origin, which is fine for local dev but means any web page could open a session against a public deployment |
+| `MAX_PLAYERS_PER_ROOM` | `3` (taca-taca specific: 2 paddles + 1 board) | Generic numeric cap per room, enforced by `Server` regardless of role |
+
+Also built in: a handshake rate limit per `Peer` (`ServerOptions.HandshakeRateLimit`, default 10 attempts/10s — throttles a broken/looping client or a simple single-source flood, not a distributed one), and `QueueReliableEvent` for game events that must survive real packet loss (retransmitted via the same reliable-delivery machinery used for input, until the client ACKs).
+
+The process handles `SIGTERM`/`SIGINT` by draining (`Server.Stop()`, which stops every room's loops and closes the transports) before exiting — needed for `docker stop` or a rolling redeploy to not just kill active matches outright.
+
+```bash
+docker build -t forgenet-tacataca .
+docker run --rm -p 9999:9999/udp -p 9443:9443/udp -p 8080:8080/tcp forgenet-tacataca
+```
+
 ## Roadmap
 
 The near-term goal is packaging this as an embeddable library per engine rather than a standalone example:
 
 1. **Unity**: a thin `MonoBehaviour` wrapper around `csharp/NetworkCore`'s embedded host, for offline/LAN play — instantiate a real server inside the app when a player hosts a match, and a matching client-only mode ("controller" role) that never renders the authoritative state.
-2. **Online play**: a `NetworkClient` mode that connects to a standalone `go/networkcore` `Server` deployment instead of an embedded host — for taca-taca specifically, the board becomes a client like any paddle controller (just a different `role` value), creates a room on start, and turns the returned join code into a QR for the paddles to scan. Requires hardening the Go `Server` for public exposure first: per-session auth tokens (raw UDP has none today), reconnection by session rather than by transport address, actually wiring the already-present-but-unused reliable-retransmission queue to game events, and a real ACME/CA certificate for WebTransport instead of the dev self-signed one.
+2. **Online play**: a `NetworkClient` mode that connects to a standalone `go/networkcore` `Server` deployment instead of an embedded host — for taca-taca specifically, the board becomes a client like any paddle controller (just a different `role` value), creates a room on start, and turns the returned join code into a QR for the paddles to scan. `Server` itself is now hardened for this (see above); still missing before real public exposure: per-session auth tokens (raw UDP still has none — a client's identity is its transport address, which can be spoofed), and reconnection by session token rather than by transport address (a brief network drop today means rejoining as a stranger, losing your room-role assignment).
 3. **Role selection + LAN discovery** at app startup — mDNS/Bonjour/NSD from day one (confirmed necessary for iOS; raw UDP broadcast doesn't reach it).
 4. **Godot / Unreal bindings** built the same way: thin native bindings over the existing `cpp/` or language-native cores, no protocol changes required.
 

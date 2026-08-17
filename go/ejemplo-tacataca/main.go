@@ -8,11 +8,18 @@
 package main
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"os/signal"
+	"strconv"
+	"strings"
 	"sync"
+	"syscall"
+	"time"
 
 	"github.com/mgueregath/ForgeNet/go/networkcore"
 )
@@ -142,7 +149,69 @@ func (s *tacaTacaState) attachTo(host *networkcore.NetworkHost) {
 	host.StateProvider = s.encode
 }
 
+// Config por variable de entorno — pensado para correr en un contenedor
+// (ver ../Dockerfile), donde hardcodear puertos/paths no sirve. Todos
+// tienen default para que `go run .` sin nada configurado siga andando
+// igual que antes.
+type config struct {
+	udpPort           uint16
+	webTransportAddr  string
+	httpAddr          string
+	webDir            string
+	tlsCertFile       string // vacío = usar certificado dev self-signed
+	tlsKeyFile        string
+	allowedOrigins    []string
+	maxPlayersPerRoom int
+}
+
+func loadConfig() config {
+	cfg := config{
+		udpPort:           9999,
+		webTransportAddr:  ":9443",
+		httpAddr:          ":8080",
+		webDir:            "../../web", // forgenet/go/ejemplo-tacataca -> forgenet/web
+		maxPlayersPerRoom: maxPaddles + 1,
+	}
+
+	if v := os.Getenv("UDP_PORT"); v != "" {
+		if port, err := strconv.ParseUint(v, 10, 16); err == nil {
+			cfg.udpPort = uint16(port)
+		} else {
+			log.Fatalf("UDP_PORT inválido: %v", err)
+		}
+	}
+	if v := os.Getenv("WEBTRANSPORT_ADDR"); v != "" {
+		cfg.webTransportAddr = v
+	}
+	if v := os.Getenv("HTTP_ADDR"); v != "" {
+		cfg.httpAddr = v
+	}
+	if v := os.Getenv("WEB_DIR"); v != "" {
+		cfg.webDir = v
+	}
+	cfg.tlsCertFile = os.Getenv("TLS_CERT_FILE")
+	cfg.tlsKeyFile = os.Getenv("TLS_KEY_FILE")
+	if v := os.Getenv("ALLOWED_ORIGINS"); v != "" {
+		for _, origin := range strings.Split(v, ",") {
+			if origin = strings.TrimSpace(origin); origin != "" {
+				cfg.allowedOrigins = append(cfg.allowedOrigins, origin)
+			}
+		}
+	}
+	if v := os.Getenv("MAX_PLAYERS_PER_ROOM"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.maxPlayersPerRoom = n
+		} else {
+			log.Fatalf("MAX_PLAYERS_PER_ROOM inválido: %v", err)
+		}
+	}
+
+	return cfg
+}
+
 func main() {
+	cfg := loadConfig()
+
 	// roomFactory: se llama una vez por sala creada (Server.HandshakeModeCreate)
 	// — cada partida de taca-taca es independiente, con su propio estado
 	// (pelota, score, barras). El Server no sabe nada de esto: solo llama
@@ -156,49 +225,89 @@ func main() {
 
 	// MaxPlayersPerRoom es el tope genérico del Server (cuenta clientes,
 	// sin distinguir roles) — para taca-taca da igual a maxPaddles+1
-	// (tablero). El cupo específico por rol (2 barras exactas) lo aplica
-	// tacaTacaState.attachTo arriba.
+	// (tablero) salvo que se pise por env. El cupo específico por rol (2
+	// barras exactas) lo aplica tacaTacaState.attachTo arriba.
 	server := networkcore.NewServer(roomFactory, networkcore.ServerOptions{
-		MaxPlayersPerRoom: maxPaddles + 1,
+		MaxPlayersPerRoom: cfg.maxPlayersPerRoom,
 	})
 
 	// Transporte UDP — clientes nativos (ej. Unity).
-	if err := server.StartUDP(9999); err != nil {
+	if err := server.StartUDP(cfg.udpPort); err != nil {
 		log.Fatalf("error arrancando UDP: %v", err)
 	}
 
 	// Transporte WebTransport — clientes de navegador. Mismo Server, así
 	// que un cliente UDP y uno de navegador pueden terminar en la misma
 	// sala (ver TestUDPAndWebTransportSamePlayerSpace en networkcore).
-	devCert, err := server.StartWebTransport(networkcore.WebTransportOptions{Addr: ":9443"})
+	//
+	// Con TLS_CERT_FILE/TLS_KEY_FILE seteados (certificado real, ej. de
+	// Let's Encrypt) se usa ese; si no, cae al self-signed de desarrollo
+	// (ver GenerateDevCertificate) — no apto para producción.
+	wtOpts := networkcore.WebTransportOptions{
+		Addr:           cfg.webTransportAddr,
+		AllowedOrigins: cfg.allowedOrigins,
+	}
+	var certHash string
+	if cfg.tlsCertFile != "" && cfg.tlsKeyFile != "" {
+		tlsConf, err := networkcore.LoadTLSCertificate(cfg.tlsCertFile, cfg.tlsKeyFile)
+		if err != nil {
+			log.Fatalf("error cargando certificado TLS: %v", err)
+		}
+		wtOpts.TLSConfig = tlsConf
+		certHash = "(certificado real — sin hash de pinning, el browser ya confía en la CA)"
+	}
+	devCert, err := server.StartWebTransport(wtOpts)
 	if err != nil {
 		log.Fatalf("error arrancando WebTransport: %v", err)
 	}
-	log.Printf("🔑 Certificate hash (sha-256, base64): %s", devCert.HashBase64)
+	if devCert != nil {
+		certHash = devCert.HashBase64
+	}
+	log.Printf("🔑 Certificate hash (sha-256, base64): %s", certHash)
 
 	// Servidor HTTP aparte, solo para servir la página de prueba del
 	// navegador (forgenet/web/) y exponer el hash del certificado dev sin
 	// tener que copiarlo a mano.
-	startBrowserPageServer(devCert.HashBase64)
+	httpServer := startBrowserPageServer(cfg.httpAddr, cfg.webDir, certHash)
 
-	select {}
+	waitForShutdownSignal()
+	log.Println("apagando: cerrando sala(s) y transportes...")
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	httpServer.Shutdown(shutdownCtx)
+	server.Stop()
+	log.Println("apagado limpio.")
 }
 
-func startBrowserPageServer(certHash string) {
-	const addr = ":8080"
-	const webDir = "../../web" // forgenet/go/ejemplo-tacataca -> forgenet/web
+// waitForShutdownSignal bloquea hasta SIGINT/SIGTERM — para que un
+// `docker stop` o un redeploy le den al server la chance de drenar salas
+// en vez de matarlo en seco.
+func waitForShutdownSignal() {
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+	<-sig
+}
 
+func startBrowserPageServer(addr, webDir, certHash string) *http.Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/certhash", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		fmt.Fprint(w, certHash)
 	})
-	mux.Handle("/", http.FileServer(http.Dir(webDir)))
 
+	if _, err := os.Stat(webDir); err == nil {
+		mux.Handle("/", http.FileServer(http.Dir(webDir)))
+	} else {
+		log.Printf("aviso: WEB_DIR %q no existe, no se sirve la página de prueba (solo /certhash)", webDir)
+	}
+
+	srv := &http.Server{Addr: addr, Handler: mux}
 	go func() {
 		log.Printf("🌐 Página de prueba en http://localhost%s/", addr)
-		if err := http.ListenAndServe(addr, mux); err != nil {
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Printf("servidor de página de prueba detenido: %v", err)
 		}
 	}()
+	return srv
 }

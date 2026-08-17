@@ -109,11 +109,70 @@ func (h *NetworkHost) start() {
 }
 
 // QueueEvent: el juego encola sus propios eventos (ej. GOAL) para que
-// salgan en el próximo snapshot.
+// salgan en el próximo snapshot. Entrega "mejor esfuerzo": si el paquete se
+// pierde, el evento no vuelve a mandarse (a diferencia del snapshot en
+// general, no hay una versión "más nueva" de un evento puntual). En LAN
+// casi no importa; en una red con pérdida real (internet) un evento que
+// cambia el marcador puede perderse en silencio — para eso ver
+// QueueReliableEvent.
 func (h *NetworkHost) QueueEvent(evt GameEvent) {
 	h.eventsMux.Lock()
 	defer h.eventsMux.Unlock()
 	h.pendingEvents = append(h.pendingEvents, evt)
+}
+
+// QueueReliableEvent hace lo mismo que QueueEvent (el evento sale en el
+// próximo snapshot de todos modos) pero además lo manda ya mismo, a cada
+// cliente conectado, como un paquete aparte marcado FlagReliable — el core
+// lo reintenta (mismo mecanismo que ya existía para reliable input, ver
+// sendLoop) hasta que el cliente lo confirma con PacketAck o se agotan los
+// reintentos. Pensado para eventos que el juego no puede permitirse perder
+// en una red con pérdida real (ej. GOAL en un server público).
+//
+// La entrega es "al menos una vez", no "exactamente una vez": el cliente
+// puede recibir el mismo evento acá y de nuevo en el snapshot normal — el
+// juego debe tratarlo como una notificación idempotente (ej. "hubo un gol,
+// resincronizá con StatePayload"), no como algo que suma un contador él
+// mismo.
+func (h *NetworkHost) QueueReliableEvent(evt GameEvent) {
+	h.QueueEvent(evt)
+
+	snap := GameSnapshot{Tick: h.tick, Timestamp: time.Now().UnixMilli(), Events: []GameEvent{evt}}
+	payload := snap.Encode()
+
+	h.clientsMux.RLock()
+	clients := make([]*ClientConnection, 0, len(h.clients))
+	for _, c := range h.clients {
+		clients = append(clients, c)
+	}
+	h.clientsMux.RUnlock()
+
+	for _, client := range clients {
+		seq := h.nextSeqNumber()
+		packet := append(buildHeader(seq, 0, PacketSnapshot, FlagReliable), payload...)
+
+		client.queueMux.Lock()
+		client.ReliableQueue = append(client.ReliableQueue, reliableMessage{Seq: seq, Data: packet, Sent: time.Now()})
+		client.queueMux.Unlock()
+
+		client.Peer.Send(packet)
+	}
+}
+
+// PendingReliableCount: cuántos paquetes reliable (ver QueueReliableEvent)
+// todavía no fueron confirmados por este cliente. Diagnóstico genérico —
+// útil para cualquier juego que quiera saber si un cliente se está
+// quedando atrás, no es específico de ningún evento en particular.
+func (h *NetworkHost) PendingReliableCount(playerID uint16) int {
+	h.clientsMux.RLock()
+	client, ok := h.clients[playerID]
+	h.clientsMux.RUnlock()
+	if !ok {
+		return 0
+	}
+	client.queueMux.Lock()
+	defer client.queueMux.Unlock()
+	return len(client.ReliableQueue)
 }
 
 func (h *NetworkHost) ConnectedPlayerCount() int {

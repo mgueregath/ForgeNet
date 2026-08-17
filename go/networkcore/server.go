@@ -21,6 +21,15 @@ type ServerOptions struct {
 	// uno, así que un límite que dependa del rol (ej. "2 barras + 1
 	// tablero" en taca-taca) es responsabilidad del juego, no de acá.
 	MaxPlayersPerRoom int
+	// HandshakeRateLimit: máximo de paquetes de handshake aceptados desde
+	// un mismo Peer (misma IP:puerto UDP, o misma sesión WebTransport) por
+	// HandshakeRateLimitWindow — el resto se descarta en silencio. Default:
+	// 10 intentos / 10s. Esto NO protege contra un atacante que rota de
+	// origen en cada intento (el core no ve la IP real, solo Peer.Key()) —
+	// sí frena un cliente roto reintentando en loop o un flood simple
+	// desde una única conexión.
+	HandshakeRateLimit       int
+	HandshakeRateLimitWindow time.Duration
 }
 
 type room struct {
@@ -51,9 +60,17 @@ type Server struct {
 	rooms map[string]*room
 	peers map[string]*peerInfo // key = Peer.Key()
 
+	handshakeMu       sync.Mutex
+	handshakeAttempts map[string]*handshakeWindow
+
 	closers    []func()
 	closersMux sync.Mutex
 	done       chan struct{}
+}
+
+type handshakeWindow struct {
+	start time.Time
+	count int
 }
 
 // NewServer crea un Server sin arrancar ningún transporte todavía — llamar
@@ -62,12 +79,19 @@ func NewServer(factory RoomFactory, opts ServerOptions) *Server {
 	if opts.RoomCodeLength <= 0 {
 		opts.RoomCodeLength = 6
 	}
+	if opts.HandshakeRateLimit <= 0 {
+		opts.HandshakeRateLimit = 10
+	}
+	if opts.HandshakeRateLimitWindow <= 0 {
+		opts.HandshakeRateLimitWindow = 10 * time.Second
+	}
 	s := &Server{
-		opts:        opts,
-		roomFactory: factory,
-		rooms:       make(map[string]*room),
-		peers:       make(map[string]*peerInfo),
-		done:        make(chan struct{}),
+		opts:              opts,
+		roomFactory:       factory,
+		rooms:             make(map[string]*room),
+		peers:             make(map[string]*peerInfo),
+		handshakeAttempts: make(map[string]*handshakeWindow),
+		done:              make(chan struct{}),
 	}
 	go s.janitorLoop()
 	return s
@@ -135,6 +159,10 @@ func (s *Server) HandlePacket(data []byte, peer Peer) {
 func (s *Server) handleHandshake(seq uint32, peer Peer, payload []byte) {
 	key := peer.Key()
 
+	if !s.allowHandshakeAttempt(key) {
+		return
+	}
+
 	// Reintento de un handshake ya admitido (el ack anterior se perdió):
 	// no crear una sala nueva ni volver a admitir, solo reenviar el ack.
 	s.mu.RLock()
@@ -180,6 +208,37 @@ func (s *Server) handleHandshake(seq uint32, peer Peer, payload []byte) {
 	s.mu.Lock()
 	s.peers[key] = &peerInfo{roomCode: r.code, ack: ack}
 	s.mu.Unlock()
+}
+
+// allowHandshakeAttempt aplica el rate limit de HandshakeRateLimit por
+// Peer — ventana fija, no token bucket: simple y suficiente para lo que
+// protege (ver ServerOptions.HandshakeRateLimit).
+func (s *Server) allowHandshakeAttempt(key string) bool {
+	s.handshakeMu.Lock()
+	defer s.handshakeMu.Unlock()
+
+	now := time.Now()
+	w, exists := s.handshakeAttempts[key]
+	if !exists || now.Sub(w.start) > s.opts.HandshakeRateLimitWindow {
+		s.handshakeAttempts[key] = &handshakeWindow{start: now, count: 1}
+		return true
+	}
+	if w.count >= s.opts.HandshakeRateLimit {
+		return false
+	}
+	w.count++
+	return true
+}
+
+func (s *Server) sweepHandshakeAttempts() {
+	s.handshakeMu.Lock()
+	defer s.handshakeMu.Unlock()
+	now := time.Now()
+	for key, w := range s.handshakeAttempts {
+		if now.Sub(w.start) > s.opts.HandshakeRateLimitWindow {
+			delete(s.handshakeAttempts, key)
+		}
+	}
 }
 
 func (s *Server) createRoom() *room {
@@ -232,6 +291,7 @@ func (s *Server) janitorLoop() {
 			return
 		case <-ticker.C:
 			s.sweepEmptyRooms()
+			s.sweepHandshakeAttempts()
 		}
 	}
 }

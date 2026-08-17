@@ -1,0 +1,7 @@
+.git
+rust/target
+csharp/*/bin
+csharp/*/obj
+**/node_modules
+**/dist
+**/__pycache__
