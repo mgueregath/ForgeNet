@@ -36,15 +36,58 @@ public:
 
     ~TestClient() { close(fd_); }
 
-    bool handshake() {
+    // handshake crea una sala nueva (HANDSHAKE_MODE_CREATE). role es
+    // opaco para el core — estos tests usan valores arbitrarios, ningún
+    // significado.
+    bool handshake(uint8_t role) {
+        return join_or_create(HANDSHAKE_MODE_CREATE, role, "");
+    }
+
+    // join se une a una sala existente por código (HANDSHAKE_MODE_JOIN).
+    bool join(uint8_t role, const std::string& room_code) {
+        return join_or_create(HANDSHAKE_MODE_JOIN, role, room_code);
+    }
+
+    bool join_or_create(uint8_t mode, uint8_t role, const std::string& room_code) {
+        auto payload = encode_join_payload(mode, role, room_code);
         auto req = build_header(0, 0, PACKET_HANDSHAKE);
+        req.insert(req.end(), payload.begin(), payload.end());
         sendto(fd_, req.data(), req.size(), 0, (struct sockaddr*)&server_addr_, sizeof(server_addr_));
 
         uint8_t buf[64];
         int n = recv(fd_, buf, sizeof(buf), 0);
-        if (n < 11) return false;
-        player_id_ = read_u16(buf + 9);
+        if (n < (int)HEADER_SIZE) return false;
+
+        Header h;
+        if (!parse_header(buf, (size_t)n, h)) return false;
+        if (h.type == PACKET_DISCONNECT) return false;
+
+        uint16_t player_id;
+        std::string got_room_code;
+        if (!decode_handshake_ack(buf + HEADER_SIZE, (size_t)n - HEADER_SIZE, player_id, got_room_code)) return false;
+
+        player_id_ = player_id;
+        room_code_ = got_room_code;
         return true;
+    }
+
+    // handshake_expect_reject intenta un handshake que se espera que el
+    // server rechace (ej. unirse a un código inexistente), y devuelve el
+    // motivo (0 si no llegó un PACKET_DISCONNECT).
+    uint8_t handshake_expect_reject(uint8_t mode, uint8_t role, const std::string& room_code) {
+        auto payload = encode_join_payload(mode, role, room_code);
+        auto req = build_header(0, 0, PACKET_HANDSHAKE);
+        req.insert(req.end(), payload.begin(), payload.end());
+        sendto(fd_, req.data(), req.size(), 0, (struct sockaddr*)&server_addr_, sizeof(server_addr_));
+
+        uint8_t buf[64];
+        int n = recv(fd_, buf, sizeof(buf), 0);
+        if (n <= 0) return 0;
+
+        Header h;
+        if (!parse_header(buf, (size_t)n, h) || h.type != PACKET_DISCONNECT) return 0;
+        if ((size_t)n < HEADER_SIZE + 1) return 0;
+        return buf[HEADER_SIZE];
     }
 
     void send_input(int16_t dx, int16_t dy, uint16_t rot, uint32_t actions, bool reliable) {
@@ -64,10 +107,28 @@ public:
         sendto(fd_, header.data(), header.size(), 0, (struct sockaddr*)&server_addr_, sizeof(server_addr_));
     }
 
+    // Confirma un paquete reliable del server. El campo "seq" del header
+    // de un PACKET_ACK es, por convención de este protocolo, el número de
+    // secuencia que se está confirmando (ver NetworkHost::handle_ack) —
+    // no un seq propio del cliente.
+    void send_ack(uint32_t acked_seq) {
+        auto packet = build_header(acked_seq, acked_seq, PACKET_ACK);
+        sendto(fd_, packet.data(), packet.size(), 0, (struct sockaddr*)&server_addr_, sizeof(server_addr_));
+    }
+
     // Lee paquetes hasta que `matches` de true o pase el timeout, descartando
     // lo que no matchea.
     bool read_until(int timeout_ms, uint8_t& out_type, std::vector<uint8_t>& out_payload,
                      std::function<bool(uint8_t, const std::vector<uint8_t>&)> matches) {
+        uint32_t seq;
+        return read_until_with_seq(timeout_ms, seq, out_type, out_payload, matches);
+    }
+
+    // Igual que read_until, pero también devuelve el seq del header — hace
+    // falta para poder ackear un paquete reliable puntual (ver send_ack)
+    // en vez de solo inspeccionar su payload.
+    bool read_until_with_seq(int timeout_ms, uint32_t& out_seq, uint8_t& out_type, std::vector<uint8_t>& out_payload,
+                              std::function<bool(uint8_t, const std::vector<uint8_t>&)> matches) {
         auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
         uint8_t buf[4096];
 
@@ -82,6 +143,7 @@ public:
             if (!parse_header(buf, (size_t)n, h)) continue;
             std::vector<uint8_t> payload(buf + HEADER_SIZE, buf + n);
             if (matches(h.type, payload)) {
+                out_seq = h.seq;
                 out_type = h.type;
                 out_payload = payload;
                 return true;
@@ -91,6 +153,7 @@ public:
     }
 
     uint16_t player_id_ = 0;
+    std::string room_code_;
 
 private:
     int fd_;
@@ -99,25 +162,27 @@ private:
 };
 
 void test_generic_mechanisms() {
-    std::cout << "== Test 1: NetworkHost <-> TestClient (mecanismos genéricos) ==" << std::endl;
+    std::cout << "== Test 1: Server <-> TestClient (mecanismos genéricos) ==" << std::endl;
 
-    NetworkHost host(49999);
+    auto host = std::make_shared<NetworkHost>();
     std::vector<uint8_t> fake_state = {10, 20, 30, 40, 50};
-    host.state_provider = [&]() { return fake_state; };
+    host->state_provider = [&]() { return fake_state; };
 
     std::mutex inputs_mutex;
     std::vector<PlayerInput> received_inputs;
-    host.on_input = [&](const PlayerInput& in) {
+    host->on_input = [&](const PlayerInput& in) {
         std::lock_guard<std::mutex> lock(inputs_mutex);
         received_inputs.push_back(in);
     };
 
-    check("host arrancó", host.start());
+    Server server([&]() { return host; }, ServerOptions{});
+    check("server arrancó", server.start_udp(49999));
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
 
     TestClient client(49999);
-    check("handshake conecta", client.handshake());
+    check("handshake conecta", client.handshake(1));
     check("playerId asignado (>0)", client.player_id_ > 0);
+    check("se recibió código de sala", !client.room_code_.empty());
 
     client.send_input(15, -7, 90, 0, false);
     client.send_input(3, 3, 45, 0x99, true);
@@ -159,7 +224,7 @@ void test_generic_mechanisms() {
         }
     }
 
-    host.queue_event(GameEvent{client.player_id_, 42, {9, 9}});
+    host->queue_event(GameEvent{client.player_id_, 42, {9, 9}});
     bool got_event = client.read_until(2000, type, payload, [](uint8_t t, const std::vector<uint8_t>& p) {
         if (t != PACKET_SNAPSHOT) return false;
         GameSnapshot s;
@@ -179,18 +244,19 @@ void test_generic_mechanisms() {
                                        [](uint8_t t, const std::vector<uint8_t>&) { return t == PACKET_PING; });
     check("ping/pong responde", got_pong);
 
-    host.stop();
+    server.stop();
 }
 
 void test_heartbeat_survives() {
     std::cout << std::endl << "== Test 2: heartbeat sobrevive >10s con actividad ==" << std::endl;
 
-    NetworkHost host(49998);
-    check("host arrancó", host.start());
+    auto host = std::make_shared<NetworkHost>();
+    Server server([&]() { return host; }, ServerOptions{});
+    check("server arrancó", server.start_udp(49998));
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
 
     TestClient client(49998);
-    client.handshake();
+    client.handshake(1);
 
     auto start = std::chrono::steady_clock::now();
     while (std::chrono::steady_clock::now() - start < std::chrono::seconds(12)) {
@@ -198,13 +264,66 @@ void test_heartbeat_survives() {
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
 
-    check("cliente sigue conectado en el host tras 12s", host.connected_player_count() == 1);
-    host.stop();
+    check("cliente sigue conectado en el host tras 12s", host->connected_player_count() == 1);
+    server.stop();
+}
+
+// Test 3: flujo genérico de salas — un cliente crea una sala (sin código
+// todavía) y recibe uno; otro cliente se une con ese código y termina en
+// la MISMA sala (mismo NetworkHost) que el primero — sin que el core sepa
+// nada de qué juego es ni de qué son los clientes.
+void test_create_and_join_room() {
+    std::cout << std::endl << "== Test 3: crear sala y unirse por código ==" << std::endl;
+
+    std::vector<std::shared_ptr<NetworkHost>> created;
+    RoomFactory factory = [&]() {
+        auto h = std::make_shared<NetworkHost>();
+        created.push_back(h);
+        return h;
+    };
+
+    Server server(factory, ServerOptions{});
+    check("server arrancó", server.start_udp(49997));
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+    TestClient creator(49997);
+    check("el creador conecta", creator.handshake(1));
+    check("el creador recibió código de sala", !creator.room_code_.empty());
+
+    TestClient joiner(49997);
+    check("el joiner se une por código", joiner.join(2, creator.room_code_));
+
+    check("joiner termina en la misma sala", joiner.room_code_ == creator.room_code_);
+    check("ambos clientes recibieron player_id distinto", creator.player_id_ != joiner.player_id_);
+    check("se creó una sola sala para un Create + un Join", created.size() == 1);
+    if (created.size() == 1) {
+        check("la sala tiene 2 clientes conectados", created[0]->connected_player_count() == 2);
+    }
+
+    server.stop();
+}
+
+// Test 4: unirse a un código que no existe debe rechazarse con
+// PACKET_DISCONNECT/REASON_ROOM_NOT_FOUND, sin crear nada.
+void test_join_nonexistent_room_rejected() {
+    std::cout << std::endl << "== Test 4: join a sala inexistente es rechazado ==" << std::endl;
+
+    Server server([]() { return std::make_shared<NetworkHost>(); }, ServerOptions{});
+    check("server arrancó", server.start_udp(49996));
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+    TestClient client(49996);
+    uint8_t reason = client.handshake_expect_reject(HANDSHAKE_MODE_JOIN, 1, "ZZZZZZ");
+    check("rechazo con REASON_ROOM_NOT_FOUND", reason == REASON_ROOM_NOT_FOUND);
+
+    server.stop();
 }
 
 int main() {
     test_generic_mechanisms();
     test_heartbeat_survives();
+    test_create_and_join_room();
+    test_join_nonexistent_room_rejected();
 
     std::cout << std::endl;
     if (failures == 0) {
