@@ -52,7 +52,10 @@ struct ClientConnection {
 
 type ConnHook = Box<dyn Fn(u16) + Send + Sync + 'static>;
 /// El core no interpreta `role`: solo lo pasa tal cual llegó del handshake.
-type RoleConnHook = Box<dyn Fn(u16, u8) + Send + Sync + 'static>;
+/// `reconnected=true` si esto fue una reconexión reconocida por IP (ver
+/// `NetworkHostHandle::admit_player`) — el juego puede usarlo para NO pisar
+/// el estado que ya tenía ese jugador con uno vacío.
+type RoleConnHook = Box<dyn Fn(u16, u8, bool) + Send + Sync + 'static>;
 type InputHook = Box<dyn Fn(PlayerInput) + Send + Sync + 'static>;
 type TickHook = Box<dyn Fn(u64) + Send + Sync + 'static>;
 type StateHook = Box<dyn Fn() -> Vec<u8> + Send + Sync + 'static>;
@@ -188,42 +191,78 @@ impl NetworkHostHandle {
         self.inner.pending_events.clone()
     }
 
+    /// Solo cuenta `connected == true` — `clients` también incluye clientes
+    /// desconectados que quedaron "reclamables" para una reconexión (ver
+    /// `heartbeat_loop`/`admit_player`), así que `clients.len()` ya no
+    /// alcanza.
     pub fn connected_player_count(&self) -> usize {
-        self.inner.clients.len()
+        self.inner.clients.iter().filter(|c| c.connected).count()
     }
 
-    /// Registra un cliente nuevo en esta sala y dispara
-    /// `on_player_connected(player_id, role)`. La llama `Server`, después de
-    /// decidir (crear/unirse) a qué sala pertenece el cliente. `role` es
-    /// opaco para el core — cada juego define sus propios valores y qué
-    /// hacer con ellos (ej. no crear una "barra" de juego para el rol que
-    /// representa al tablero). Idempotente: un cliente que ya está admitido
-    /// devuelve su player_id actual sin duplicar estado (cubre el reintento
-    /// de un handshake cuyo ack se perdió).
-    pub fn admit_player(&self, addr: SocketAddr, role: u8) -> u16 {
+    /// Registra un cliente nuevo en esta sala, o reconoce una reconexión, y
+    /// dispara `on_player_connected(player_id, role, reconnected)`. La llama
+    /// `Server`, después de decidir (crear/unirse) a qué sala pertenece el
+    /// cliente. `role` es opaco para el core — cada juego define sus propios
+    /// valores y qué hacer con ellos (ej. no crear una "barra" de juego para
+    /// el rol que representa al tablero).
+    ///
+    /// Reconexión: si hay un cliente marcado desconectado (ver
+    /// `heartbeat_loop`) con la misma IP (`addr.ip()`, ignorando el puerto —
+    /// que cambia en cada reconexión, nuevo socket UDP) que quien está
+    /// haciendo el handshake, se le devuelve la MISMA identidad (player_id,
+    /// y el role ORIGINAL — no el que venga en este handshake, para no
+    /// perder de vista quién era) en vez de crear un jugador nuevo. Es una
+    /// heurística por IP, no un token de sesión (el protocolo no lleva uno
+    /// todavía): funciona bien en la LAN/datos móviles típica, donde cada
+    /// dispositivo tiene su propia IP — no es a prueba de balas si dos
+    /// jugadores comparten la misma IP pública (NAT compartido) y ambos
+    /// están desconectados a la vez.
+    ///
+    /// Idempotente además en el sentido de siempre: un cliente que ya está
+    /// admitido (misma addr, sin pasar por desconexión) devuelve su
+    /// player_id actual sin duplicar estado ni disparar el hook de nuevo
+    /// (cubre el reintento de un handshake cuyo ack se perdió).
+    pub fn admit_player(&self, addr: SocketAddr, role: u8) -> (u16, bool) {
         if let Some(existing) = self.inner.clients_by_addr.get(&addr) {
-            return *existing;
+            return (*existing, false);
         }
 
-        let player_id = self.inner.next_player_id.fetch_add(1, Ordering::Relaxed) as u16;
-        self.inner.clients_by_addr.insert(addr, player_id);
-        self.inner.clients.insert(
-            player_id,
-            ClientConnection {
+        let reclaim_id = self
+            .inner
+            .clients
+            .iter()
+            .find(|c| !c.connected && c.addr.ip() == addr.ip())
+            .map(|c| c.player_id);
+
+        let (player_id, role, reconnected) = if let Some(id) = reclaim_id {
+            let mut client = self.inner.clients.get_mut(&id).unwrap();
+            client.addr = addr;
+            client.connected = true;
+            client.last_heartbeat = Instant::now();
+            (id, client.role, true)
+        } else {
+            let player_id = self.inner.next_player_id.fetch_add(1, Ordering::Relaxed) as u16;
+            self.inner.clients.insert(
                 player_id,
-                addr,
-                role,
-                last_heartbeat: Instant::now(),
-                ping: 0,
-                connected: true,
-                reliable_queue: Vec::new(),
-            },
-        );
+                ClientConnection {
+                    player_id,
+                    addr,
+                    role,
+                    last_heartbeat: Instant::now(),
+                    ping: 0,
+                    connected: true,
+                    reliable_queue: Vec::new(),
+                },
+            );
+            (player_id, role, false)
+        };
+
+        self.inner.clients_by_addr.insert(addr, player_id);
 
         if let Some(cb) = &self.inner.on_player_connected {
-            cb(player_id, role);
+            cb(player_id, role, reconnected);
         }
-        player_id
+        (player_id, reconnected)
     }
 
     /// Rol opaco con el que se admitió a un jugador (ver `admit_player`).
@@ -469,19 +508,29 @@ async fn heartbeat_loop(inner: Arc<Inner>) {
         }
 
         let now = Instant::now();
-        let mut to_remove = Vec::new();
+        let mut to_disconnect = Vec::new();
         for client in inner.clients.iter() {
-            if now.duration_since(client.last_heartbeat) > HEARTBEAT_TIMEOUT {
-                to_remove.push((client.player_id, client.addr));
+            if client.connected && now.duration_since(client.last_heartbeat) > HEARTBEAT_TIMEOUT {
+                to_disconnect.push((client.player_id, client.addr));
             }
         }
 
-        for (id, addr) in &to_remove {
-            inner.clients.remove(id);
+        // Solo se marca connected=false — a propósito NO se borra de
+        // `clients`: se mantiene "reclamable" por `admit_player` si el mismo
+        // dispositivo (misma IP) vuelve a conectarse, así el juego puede
+        // restaurar su estado en vez de tratarlo como uno nuevo.
+        // `clients_by_addr` sí se limpia: esa entrada (ej. ip:puerto UDP
+        // viejo) ya no sirve para rutear nada. El Server, por su lado, no
+        // destruye esta sala instantáneamente al quedar en 0 conectados —
+        // ver `ServerOptions::empty_room_grace_period`.
+        for (id, addr) in &to_disconnect {
+            if let Some(mut client) = inner.clients.get_mut(id) {
+                client.connected = false;
+            }
             inner.clients_by_addr.remove(addr);
         }
 
-        for (id, _) in &to_remove {
+        for (id, _) in &to_disconnect {
             if let Some(cb) = &inner.on_player_disconnected {
                 cb(*id);
             }

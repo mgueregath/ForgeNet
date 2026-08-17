@@ -74,7 +74,7 @@ fn attach_to(state: Arc<Mutex<TacaTacaState>>, host: &mut NetworkHost) {
     let events = host.events();
 
     let s = state.clone();
-    host.on_player_connected = Some(Box::new(move |id, role| {
+    host.on_player_connected = Some(Box::new(move |id, role, _reconnected| {
         if role != ROLE_PADDLE {
             return;
         }

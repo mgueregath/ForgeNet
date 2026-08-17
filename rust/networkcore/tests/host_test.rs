@@ -321,7 +321,7 @@ async fn test_role_is_opaque_but_exposed() {
     let got_roles_clone = got_roles.clone();
 
     let mut host = NetworkHost::new();
-    host.on_player_connected = Some(Box::new(move |id, role| {
+    host.on_player_connected = Some(Box::new(move |id, role, _reconnected| {
         got_roles_clone.lock().unwrap().insert(id, role);
     }));
 
@@ -380,7 +380,7 @@ async fn test_queue_reliable_event_retransmits_until_acked() {
 
     let mut client = TestClient::connect(39993);
     let client_addr = client.socket.local_addr().unwrap();
-    let player_id = handle.admit_player(client_addr, 1);
+    let (player_id, _reconnected) = handle.admit_player(client_addr, 1);
 
     handle.queue_reliable_event(GameEvent { player_id, event_type: 9, data: vec![7] });
 
@@ -418,4 +418,129 @@ async fn test_queue_reliable_event_retransmits_until_acked() {
     assert!(cleared, "la cola de retransmisión no se vació después del ack");
 
     handle.stop();
+}
+
+/// Análogo a `TestReconnectionByIPPreservesIdentity` en Go: un cliente que
+/// se cae (deja de mandar heartbeat) y vuelve a conectarse desde la misma IP
+/// a la misma sala recibe el mismo player_id y el role ORIGINAL — no el
+/// nuevo que mande en el segundo handshake — ver el comentario grande en
+/// `NetworkHostHandle::admit_player`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_reconnection_by_ip_preserves_identity() {
+    let calls: Arc<Mutex<Vec<(u16, u8, bool)>>> = Arc::new(Mutex::new(Vec::new()));
+    let calls_clone = calls.clone();
+
+    let mut host = NetworkHost::new();
+    host.on_player_connected = Some(Box::new(move |id, role, reconnected| {
+        calls_clone.lock().unwrap().push((id, role, reconnected));
+    }));
+
+    let server = Server::new(single_room_factory(host), ServerOptions::default());
+    server.start_udp(39992).await.expect("start_udp falló");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let mut first = TestClient::connect(39992);
+    first.handshake(7);
+    let first_id = first.player_id;
+    let room_code = first.room_code.clone();
+    drop(first); // simula la caída: deja de mandar heartbeat
+
+    // heartbeat_timeout del core es 10s (constante privada, no exportada) —
+    // el mismo valor que ya asume test_heartbeat_survives_10_seconds arriba.
+    tokio::time::sleep(Duration::from_millis(10_500)).await;
+
+    let mut second = TestClient::connect(39992);
+    second.join(3, &room_code); // role distinto a propósito: debe ignorarse
+
+    assert_eq!(second.player_id, first_id, "reconexión no preservó el player_id");
+
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls.len(), 2, "esperaba 2 llamadas a on_player_connected");
+    assert!(!calls[0].2, "la primera conexión no debería marcarse reconnected");
+    assert!(calls[1].2, "la segunda conexión debería reconocerse como reconnected");
+    assert_eq!(
+        calls[1].1, 7,
+        "el role tras reconexión debe ser el original (7), no el de la reconexión (3)"
+    );
+    drop(calls);
+
+    server.stop();
+}
+
+/// Análogo a `TestUDPPortEphemeral` en Go: pedir el puerto 0 le deja al SO
+/// elegir uno libre, y `udp_port()` debe devolver cuál asignó de verdad (no
+/// 0) — hace falta para un deployment que no quiere depender de que un
+/// puerto fijo esté siempre libre.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_udp_port_ephemeral() {
+    let server = Server::new(Box::new(NetworkHost::new), ServerOptions::default());
+    server.start_udp(0).await.expect("start_udp falló");
+
+    let port = server.udp_port();
+    assert_ne!(port, 0, "udp_port() debería devolver el puerto real asignado por el SO, no 0");
+
+    let mut client = TestClient::connect(port);
+    client.handshake(1);
+    assert!(client.player_id > 0, "handshake contra el puerto efímero falló");
+
+    server.stop();
+}
+
+/// Análogo a `TestEmbeddedHostMode` en Go: el modo "host embebido" (ej. un
+/// tablero LAN que corre el `Server` él mismo) — la sala existe de entrada,
+/// vía `Server::create_room()` — sin ningún cliente todavía — y los mandos
+/// se unen después con un handshake normal (`HANDSHAKE_MODE_JOIN`), igual
+/// que en el modo "server online" (una sala creada porque un cliente mandó
+/// `HANDSHAKE_MODE_CREATE`). Mismo `Server`, misma sala — la única
+/// diferencia es quién la creó y cómo.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_host_created_room_joinable() {
+    let fake_state = vec![9u8, 9, 9];
+    let factory: RoomFactory = Box::new(move || {
+        let mut host = NetworkHost::new();
+        let fs = fake_state.clone();
+        host.state_provider = Some(Box::new(move || fs.clone()));
+        host
+    });
+    let server = Server::new(factory, ServerOptions::default());
+    server.start_udp(39985).await.expect("start_udp falló");
+
+    let room_code = server.create_room();
+    assert!(!room_code.is_empty(), "create_room() no devolvió código de sala");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let mut mando = TestClient::connect(39985);
+    mando.join(1, &room_code);
+    assert!(mando.player_id > 0, "player_id no asignado");
+    assert_eq!(mando.room_code, room_code, "el mando terminó en otra sala");
+
+    server.stop();
+}
+
+/// Análogo a `TestEmbeddedHostRoomSurvivesEmptyGracePeriod` en Go: una sala
+/// pre-creada (modo host embebido) que todavía no admitió a NADIE no debe
+/// destruirse nunca por el janitor, sin importar cuánto tiempo pase — el
+/// tablero puede quedarse esperando en el lobby indefinidamente. Solo
+/// empieza a correr el `empty_room_grace_period` una vez que la sala tuvo al
+/// menos un cliente (ver `had_player` en server.rs). El sleep acá cruza a
+/// propósito varios ticks del janitor (cada 5s) con un grace period
+/// artificialmente corto (300ms), para que el bug (si existiera) se
+/// manifieste de verdad y no por casualidad de timing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_host_created_empty_room_survives_grace_period() {
+    let server = Server::new(
+        Box::new(NetworkHost::new),
+        ServerOptions { empty_room_grace_period: Duration::from_millis(300), ..ServerOptions::default() },
+    );
+    server.start_udp(39984).await.expect("start_udp falló");
+
+    let room_code = server.create_room();
+
+    tokio::time::sleep(Duration::from_secs(6)).await;
+
+    let mut client = TestClient::connect(39984);
+    client.join(1, &room_code);
+    assert!(client.player_id > 0, "la sala pre-creada no sobrevivió la espera");
+
+    server.stop();
 }

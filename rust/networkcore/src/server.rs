@@ -43,6 +43,11 @@ pub struct ServerOptions {
     /// conexión.
     pub handshake_rate_limit: usize,
     pub handshake_rate_limit_window: Duration,
+    /// Cuánto se espera, desde que una sala que ya tuvo jugadores queda en 0
+    /// conectados, antes de destruirla — no instantáneo, para darle tiempo a
+    /// `admit_player` de reconocer una reconexión (ver el comentario grande
+    /// ahí) antes de que la sala misma deje de existir. Default: 30s.
+    pub empty_room_grace_period: Duration,
 }
 
 impl Default for ServerOptions {
@@ -52,6 +57,7 @@ impl Default for ServerOptions {
             max_players_per_room: 0,
             handshake_rate_limit: 10,
             handshake_rate_limit_window: Duration::from_secs(10),
+            empty_room_grace_period: Duration::from_secs(30),
         }
     }
 }
@@ -67,6 +73,9 @@ impl ServerOptions {
         if self.handshake_rate_limit_window.is_zero() {
             self.handshake_rate_limit_window = Duration::from_secs(10);
         }
+        if self.empty_room_grace_period.is_zero() {
+            self.empty_room_grace_period = Duration::from_secs(30);
+        }
         self
     }
 }
@@ -75,8 +84,14 @@ struct Room {
     code: String,
     host: NetworkHostHandle,
     /// Una sala recién creada que todavía no tuvo ningún cliente no se
-    /// destruye aunque tenga cero conectados (ver `sweep_empty_rooms`).
+    /// destruye aunque tenga cero conectados (ver `sweep_empty_rooms`). Una
+    /// sala creada directamente vía `Server::create_room` (modo "host
+    /// embebido") arranca en `false` igual que cualquier otra — no cuenta
+    /// como "tuvo jugador" solo por haber sido creada.
     had_player: AtomicBool,
+    /// Desde cuándo `connected_player_count()` está en 0 — `None` mientras
+    /// la sala tiene al menos un cliente conectado. Ver `sweep_empty_rooms`.
+    empty_since: std::sync::Mutex<Option<Instant>>,
 }
 
 /// Recuerda a qué sala pertenece cada peer y guarda el último ack de
@@ -127,15 +142,32 @@ impl Server {
     }
 
     /// Liga un socket UDP y arranca su loop de recepción.
+    ///
+    /// `port=0` le pide al SO cualquier puerto disponible — útil para un
+    /// deployment que no quiere depender de que un puerto fijo esté libre.
+    /// El puerto real que asignó el SO queda disponible en `udp_port()`.
     pub async fn start_udp(self: &Arc<Self>, port: u16) -> std::io::Result<()> {
         let socket = Arc::new(UdpSocket::bind(("0.0.0.0", port)).await?);
+        let real_port = socket.local_addr()?.port();
         // Solo puede haber un socket UDP por Server — set() falla en
         // silencio si ya se llamó start_udp antes (no debería pasar).
         let _ = self.socket.set(socket.clone());
 
-        println!("🎮 Server (UDP) escuchando en :{} (60Hz)", port);
+        println!("🎮 Server (UDP) escuchando en :{} (60Hz)", real_port);
         tokio::spawn(udp_receive_loop(self.clone(), socket));
         Ok(())
+    }
+
+    /// Devuelve el puerto UDP real en el que quedó escuchando el server — el
+    /// mismo que se pidió en `start_udp`, salvo que se haya pedido 0
+    /// (cualquiera disponible), en cuyo caso es el que el SO asignó de
+    /// verdad. 0 si `start_udp` nunca se llamó (o falló).
+    pub fn udp_port(&self) -> u16 {
+        self.socket
+            .get()
+            .and_then(|s| s.local_addr().ok())
+            .map(|a| a.port())
+            .unwrap_or(0)
     }
 
     /// Cierra el server: detiene el loop de janitor, todas las salas
@@ -192,7 +224,7 @@ impl Server {
         };
 
         let room = match mode {
-            HANDSHAKE_MODE_CREATE => self.create_room(),
+            HANDSHAKE_MODE_CREATE => self.new_room(),
             HANDSHAKE_MODE_JOIN => match self.rooms.get(&room_code).map(|r| r.clone()) {
                 Some(r) => r,
                 None => {
@@ -214,7 +246,7 @@ impl Server {
             return;
         }
 
-        let player_id = room.host.admit_player(addr, role);
+        let (player_id, _reconnected) = room.host.admit_player(addr, role);
         room.had_player.store(true, Ordering::SeqCst);
 
         let mut ack = build_header(seq, 0, PACKET_HANDSHAKE, 0);
@@ -258,7 +290,24 @@ impl Server {
             .retain(|_, w| now.duration_since(w.start) <= self.opts.handshake_rate_limit_window);
     }
 
-    fn create_room(self: &Arc<Self>) -> Arc<Room> {
+    /// Arranca una sala directamente, sin pasar por un handshake de red — a
+    /// diferencia de una sala creada porque un cliente mandó
+    /// `HANDSHAKE_MODE_CREATE`, acá no hay ningún cliente admitido todavía.
+    ///
+    /// Pensado para el modo "host embebido" (ej. un tablero en LAN, que es
+    /// el mismo proceso que corre el `Server`): la app llama a esto una vez
+    /// al arrancar y ya tiene una sala fija a la que los mandos se unen (vía
+    /// handshake con `HANDSHAKE_MODE_JOIN`), sin que el propio tablero tenga
+    /// que hacerse pasar por cliente de sí mismo para "crear" la sala. La
+    /// sala recién creada NO cuenta como "vacía" para el janitor (ver
+    /// `sweep_empty_rooms`/`had_player`) hasta que admite a su primer
+    /// cliente de verdad, así que puede esperar indefinidamente a que
+    /// alguien se una sin que `empty_room_grace_period` la destruya.
+    pub fn create_room(self: &Arc<Self>) -> String {
+        self.new_room().code.clone()
+    }
+
+    fn new_room(self: &Arc<Self>) -> Arc<Room> {
         let code = self.generate_unique_room_code();
         let host = (self.room_factory)();
         let socket = self
@@ -272,6 +321,7 @@ impl Server {
             code: code.clone(),
             host: handle,
             had_player: AtomicBool::new(false),
+            empty_since: std::sync::Mutex::new(None),
         });
         self.rooms.insert(code, room.clone());
         room
@@ -292,15 +342,30 @@ impl Server {
         }
     }
 
-    /// Destruye salas que se quedaron sin ningún cliente conectado —
-    /// genérico, no sabe qué juego corre en ellas. Una sala recién creada
-    /// que todavía no tuvo ningún cliente no se toca (`had_player`).
+    /// Destruye salas que se quedaron sin ningún cliente conectado durante
+    /// más de `empty_room_grace_period` — genérico, no sabe qué juego corre
+    /// en ellas. Una sala recién creada que todavía no tuvo ningún cliente
+    /// no se toca (`had_player`).
     fn sweep_empty_rooms(&self) {
+        let now = Instant::now();
         let to_remove: Vec<String> = self
             .rooms
             .iter()
-            .filter(|r| r.had_player.load(Ordering::SeqCst) && r.host.connected_player_count() == 0)
-            .map(|r| r.code.clone())
+            .filter_map(|r| {
+                if !r.had_player.load(Ordering::SeqCst) {
+                    return None;
+                }
+                if r.host.connected_player_count() > 0 {
+                    *r.empty_since.lock().unwrap() = None;
+                    return None;
+                }
+                let mut empty_since = r.empty_since.lock().unwrap();
+                let since = *empty_since.get_or_insert(now);
+                if now.duration_since(since) < self.opts.empty_room_grace_period {
+                    return None;
+                }
+                Some(r.code.clone())
+            })
             .collect();
 
         for code in to_remove {
