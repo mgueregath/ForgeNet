@@ -2,10 +2,14 @@
 
 A generic multiplayer networking core, implemented from scratch **in 6 languages** (Go, Rust, Python, C++, TypeScript, C#), sharing the same wire protocol and the same design principle: **the transport layer knows nothing about the game running on top of it.**
 
-Handshake, heartbeat, input, snapshots, reliable delivery and ping are handled by the core. Game state travels as an opaque `StatePayload` — bytes the core moves but never interprets — and the game plugs in through four hooks:
+Handshake, heartbeat, input, snapshots, reliable delivery and ping are handled by the core. Game state travels as an opaque `StatePayload` — bytes the core moves but never interprets — and the game plugs in through four hooks, plus one opaque field:
 
 ```
-on_player_connected / on_player_disconnected
+on_player_connected(player_id, role) / on_player_disconnected(player_id)
+                  — role is an opaque byte the core stores and forwards,
+                    never interprets: each game defines what its values
+                    mean (e.g. taca-taca uses one for "paddle", another
+                    for "board")
 on_input          — raw input per tick (delta_x/delta_y/rotation/actions)
 on_tick           — fired once per tick so the game can step its simulation
 state_provider    — the game hands back its current state bytes on each snapshot
@@ -15,6 +19,8 @@ queue_event       — the game queues its own events (e.g. GOAL) with arbitrary 
 Every language folder ships a `networkcore` library plus a small `tacataca` example (a 2-paddle ball game) built **on top of** the core — proving the same core can host different games without being touched.
 
 `go/networkcore` additionally accepts **two transports at once** — raw UDP and WebTransport/QUIC — so a browser tab and a native (Unity) client can be in the same match, talking to the same host, without the core caring which is which.
+
+`go/networkcore` also multiplexes many concurrent matches over one running server (`Server`, in `server.go`): a client's handshake either creates a new room (server generates and returns a short join code) or joins an existing one by that code, and everything after the handshake — input, ack, ping — gets routed to the right room automatically. This is what lets one deployed process host many simultaneous online games instead of one process per match; the join code is plain data (a short string), so turning it into a QR code, a deep link, or a typed-in code is entirely up to whatever renders it client-side.
 
 ## Why this exists
 
@@ -84,9 +90,10 @@ Full per-language detail (test counts, design notes, known caveats) lives inline
 
 The near-term goal is packaging this as an embeddable library per engine rather than a standalone example:
 
-1. **Unity**: a thin `MonoBehaviour` wrapper around `csharp/NetworkCore`'s embedded host — instantiate a real server inside the app when a player hosts a match, and a matching client-only mode ("controller" role) that never renders the authoritative state.
-2. **Role selection + LAN discovery** at app startup — mDNS/Bonjour/NSD from day one (confirmed necessary for iOS; raw UDP broadcast doesn't reach it).
-3. **Godot / Unreal bindings** built the same way: thin native bindings over the existing `cpp/` or language-native cores, no protocol changes required.
+1. **Unity**: a thin `MonoBehaviour` wrapper around `csharp/NetworkCore`'s embedded host, for offline/LAN play — instantiate a real server inside the app when a player hosts a match, and a matching client-only mode ("controller" role) that never renders the authoritative state.
+2. **Online play**: a `NetworkClient` mode that connects to a standalone `go/networkcore` `Server` deployment instead of an embedded host — for taca-taca specifically, the board becomes a client like any paddle controller (just a different `role` value), creates a room on start, and turns the returned join code into a QR for the paddles to scan. Requires hardening the Go `Server` for public exposure first: per-session auth tokens (raw UDP has none today), reconnection by session rather than by transport address, actually wiring the already-present-but-unused reliable-retransmission queue to game events, and a real ACME/CA certificate for WebTransport instead of the dev self-signed one.
+3. **Role selection + LAN discovery** at app startup — mDNS/Bonjour/NSD from day one (confirmed necessary for iOS; raw UDP broadcast doesn't reach it).
+4. **Godot / Unreal bindings** built the same way: thin native bindings over the existing `cpp/` or language-native cores, no protocol changes required.
 
 ## License
 

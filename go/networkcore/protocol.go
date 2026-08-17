@@ -1,4 +1,4 @@
-// Package networkcore es el port a Go de nucleo-multiplayer/csharp/NetworkCore:
+// Package networkcore es el port a Go de forgenet/csharp/NetworkCore:
 // transporte UDP genérico (handshake, heartbeat, input, snapshot, reliable,
 // ping) sin ningún esquema de juego hardcodeado. El juego se engancha vía
 // callbacks (OnInput, OnTick, StateProvider, QueueEvent) — ver host.go.
@@ -50,4 +50,56 @@ func parseHeader(data []byte) (seq, ack uint32, packetType, flags byte, ok bool)
 	packetType = typeAndFlags & 0x0F
 	flags = (typeAndFlags >> 4) & 0x0F
 	return seq, ack, packetType, flags, true
+}
+
+// --- Payload del handshake (join) ---
+//
+// El core no sabe qué juego corre encima, así que Role viaja como un byte
+// opaco: cada juego define sus propios valores y su propio significado (ej.
+// taca-taca usa un valor para "barra" y otro para "tablero" — ver su
+// ejemplo), igual que ya pasa con StatePayload y GameEvent.EventType.
+
+// Modos de handshake — quién crea una sala nueva vs. quién se une a una
+// existente por código. Esto sí es genérico: cualquier juego con sesiones
+// de partida necesita esta distinción.
+const (
+	HandshakeModeCreate uint8 = 0x00
+	HandshakeModeJoin   uint8 = 0x01
+)
+
+// Motivos de rechazo del handshake, enviados en un PacketDisconnect.
+const (
+	ReasonRoomNotFound uint8 = 0x01
+	ReasonRoomFull     uint8 = 0x02
+)
+
+// EncodeJoinPayload: Mode(1) + Role(1) + RoomCodeLen(1) + RoomCode(N). Va
+// después del header en un PacketHandshake enviado por el cliente. RoomCode
+// se ignora en HandshakeModeCreate (el server genera el código).
+func EncodeJoinPayload(mode, role uint8, roomCode string) []byte {
+	buf := make([]byte, 0, 3+len(roomCode))
+	buf = append(buf, mode, role, byte(len(roomCode)))
+	buf = append(buf, roomCode...)
+	return buf
+}
+
+func decodeJoinPayload(payload []byte) (mode, role uint8, roomCode string, ok bool) {
+	if len(payload) < 3 {
+		return 0, 0, "", false
+	}
+	codeLen := int(payload[2])
+	if len(payload) < 3+codeLen {
+		return 0, 0, "", false
+	}
+	return payload[0], payload[1], string(payload[3 : 3+codeLen]), true
+}
+
+// encodeHandshakeAck: PlayerID(2) + RoomCodeLen(1) + RoomCode(N). Va después
+// del header en la respuesta del server — tanto quien crea la sala como
+// quien se une reciben el código, para poder compartirlo (ej. un QR).
+func encodeHandshakeAck(playerID uint16, roomCode string) []byte {
+	buf := make([]byte, 0, 3+len(roomCode))
+	buf = append(buf, byte(playerID>>8), byte(playerID), byte(len(roomCode)))
+	buf = append(buf, roomCode...)
+	return buf
 }

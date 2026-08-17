@@ -115,14 +115,14 @@ func GenerateDevCertificate() (*DevCertificate, error) {
 
 // StartWebTransport arranca un listener WebTransport (QUIC/HTTP-3) además
 // de (o en vez de) StartUDP — se pueden usar los dos a la vez en el mismo
-// NetworkHost: un cliente Unity (UDP) y un cliente de navegador
-// (WebTransport) terminan jugando la misma partida, porque ambos
-// transportes alimentan el mismo HandlePacket.
+// Server: un cliente Unity (UDP) y un cliente de navegador (WebTransport)
+// pueden terminar jugando la misma partida, porque ambos transportes
+// alimentan el mismo Server.HandlePacket.
 //
 // Si opts.TLSConfig es nil, genera y devuelve un certificado de desarrollo
 // (ver GenerateDevCertificate) — el llamador necesita su HashBase64 para
 // configurar el cliente browser.
-func (h *NetworkHost) StartWebTransport(opts WebTransportOptions) (*DevCertificate, error) {
+func (s *Server) StartWebTransport(opts WebTransportOptions) (*DevCertificate, error) {
 	path := opts.Path
 	if path == "" {
 		path = "/webtransport"
@@ -164,11 +164,10 @@ func (h *NetworkHost) StartWebTransport(opts WebTransportOptions) (*DevCertifica
 			w.WriteHeader(500)
 			return
 		}
-		go h.webtransportSessionLoop(sess)
+		go s.webtransportSessionLoop(sess)
 	})
 
-	h.ensureLoopsStarted()
-	h.registerCloser(func() { wtServer.Close() })
+	s.registerCloser(func() { wtServer.Close() })
 
 	go func() {
 		if err := wtServer.ListenAndServe(); err != nil {
@@ -176,11 +175,11 @@ func (h *NetworkHost) StartWebTransport(opts WebTransportOptions) (*DevCertifica
 		}
 	}()
 
-	log.Printf("🌐 NetworkHost (WebTransport) escuchando en %s%s", opts.Addr, path)
+	log.Printf("🌐 Server (WebTransport) escuchando en %s%s", opts.Addr, path)
 	return devCert, nil
 }
 
-func (h *NetworkHost) webtransportSessionLoop(sess *webtransport.Session) {
+func (s *Server) webtransportSessionLoop(sess *webtransport.Session) {
 	peer := &wtPeer{sess: sess, key: fmt.Sprintf("wt:%p", sess)}
 	ctx := sess.Context()
 
@@ -189,6 +188,6 @@ func (h *NetworkHost) webtransportSessionLoop(sess *webtransport.Session) {
 		if err != nil {
 			return // sesión cerrada por el cliente o por timeout
 		}
-		h.HandlePacket(data, peer)
+		s.HandlePacket(data, peer)
 	}
 }

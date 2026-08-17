@@ -21,6 +21,7 @@ type testWebTransportClient struct {
 	transport *webtransport.Transport
 	sess      *webtransport.Session
 	playerID  uint16
+	roomCode  string
 	seq       uint32
 }
 
@@ -61,9 +62,20 @@ func (c *testWebTransportClient) close() {
 	c.transport.Close()
 }
 
-func (c *testWebTransportClient) handshake(t *testing.T) {
+func (c *testWebTransportClient) handshake(t *testing.T, role uint8) {
 	t.Helper()
-	req := buildHeader(0, 0, PacketHandshake, 0)
+	c.joinOrCreate(t, HandshakeModeCreate, role, "")
+}
+
+func (c *testWebTransportClient) join(t *testing.T, role uint8, roomCode string) {
+	t.Helper()
+	c.joinOrCreate(t, HandshakeModeJoin, role, roomCode)
+}
+
+func (c *testWebTransportClient) joinOrCreate(t *testing.T, mode, role uint8, roomCode string) {
+	t.Helper()
+	payload := EncodeJoinPayload(mode, role, roomCode)
+	req := append(buildHeader(0, 0, PacketHandshake, 0), payload...)
 	if err := c.sess.SendDatagram(req); err != nil {
 		t.Fatal(err)
 	}
@@ -74,10 +86,12 @@ func (c *testWebTransportClient) handshake(t *testing.T) {
 	if err != nil {
 		t.Fatalf("handshake sin respuesta: %v", err)
 	}
-	if len(resp) < 11 {
+	if len(resp) < HeaderSize+3 {
 		t.Fatalf("respuesta de handshake muy corta: %d bytes", len(resp))
 	}
-	c.playerID = uint16(resp[9])<<8 | uint16(resp[10])
+	c.playerID = uint16(resp[HeaderSize])<<8 | uint16(resp[HeaderSize+1])
+	codeLen := int(resp[HeaderSize+2])
+	c.roomCode = string(resp[HeaderSize+3 : HeaderSize+3+codeLen])
 }
 
 func (c *testWebTransportClient) sendInput(t *testing.T, dx, dy int16, rot uint16, actions uint32) {
@@ -124,17 +138,18 @@ func TestWebTransportHandshakeInputSnapshot(t *testing.T) {
 		receivedInputs = append(receivedInputs, input)
 	}
 
-	devCert, err := host.StartWebTransport(WebTransportOptions{Addr: "127.0.0.1:34433"})
+	server := NewServer(func() *NetworkHost { return host }, ServerOptions{})
+	devCert, err := server.StartWebTransport(WebTransportOptions{Addr: "127.0.0.1:34433"})
 	if err != nil {
 		t.Fatalf("StartWebTransport falló: %v", err)
 	}
-	defer host.Stop()
+	defer server.Stop()
 	time.Sleep(300 * time.Millisecond)
 
 	client := newTestWebTransportClient(t, "https://127.0.0.1:34433/webtransport", devCert.HashBase64)
 	defer client.close()
 
-	client.handshake(t)
+	client.handshake(t, 1)
 	if client.playerID == 0 {
 		t.Fatal("playerID no asignado")
 	}
@@ -180,28 +195,33 @@ func TestWebTransportHandshakeInputSnapshot(t *testing.T) {
 }
 
 // TestUDPAndWebTransportSamePlayerSpace prueba lo importante de todo esto:
-// un cliente UDP y un cliente WebTransport conectados al MISMO NetworkHost
-// terminan en la misma partida (ambos cuentan en ConnectedPlayerCount, y
-// ambos reciben el snapshot del mismo estado).
+// un cliente UDP y un cliente WebTransport, en la MISMA sala (uno la crea,
+// el otro se une con el código), terminan en el mismo NetworkHost (ambos
+// cuentan en ConnectedPlayerCount, y ambos reciben el snapshot del mismo
+// estado) — el core no distingue de qué transporte vino cada uno.
 func TestUDPAndWebTransportSamePlayerSpace(t *testing.T) {
-	host := NewNetworkHost()
+	var host *NetworkHost
+	server := NewServer(func() *NetworkHost {
+		host = NewNetworkHost()
+		return host
+	}, ServerOptions{})
 
-	if err := host.StartUDP(34434); err != nil {
+	if err := server.StartUDP(34434); err != nil {
 		t.Fatalf("StartUDP falló: %v", err)
 	}
-	devCert, err := host.StartWebTransport(WebTransportOptions{Addr: "127.0.0.1:34435"})
+	devCert, err := server.StartWebTransport(WebTransportOptions{Addr: "127.0.0.1:34435"})
 	if err != nil {
 		t.Fatalf("StartWebTransport falló: %v", err)
 	}
-	defer host.Stop()
+	defer server.Stop()
 	time.Sleep(300 * time.Millisecond)
 
 	udpClient := newTestClient(t, 34434)
-	udpClient.handshake(t)
+	udpClient.handshake(t, 1)
 
 	wtClient := newTestWebTransportClient(t, "https://127.0.0.1:34435/webtransport", devCert.HashBase64)
 	defer wtClient.close()
-	wtClient.handshake(t)
+	wtClient.join(t, 2, udpClient.roomCode)
 
 	if udpClient.playerID == wtClient.playerID {
 		t.Fatalf("ambos clientes recibieron el mismo playerID (%d) — deberían ser distintos", udpClient.playerID)

@@ -1,8 +1,10 @@
 // Ejemplo de "juego" construido ENCIMA de networkcore, no dentro de él.
-// Prueba que el core es de verdad genérico: NetworkHost no sabe qué es una
-// "barra" ni una "pelota" — este paquete es el que define ese esquema y lo
-// conecta a los hooks genéricos (OnInput/OnTick/StateProvider/QueueEvent).
-// Análogo a nucleo-multiplayer/csharp/NetworkCore.Tests/TacaTacaExample.cs.
+// Prueba que el core es de verdad genérico: ni NetworkHost ni Server saben
+// qué es una "barra", una "pelota" ni un "tablero" — este paquete es el que
+// define ese esquema y lo conecta a los hooks genéricos
+// (OnInput/OnTick/StateProvider/QueueEvent), incluido el significado de
+// Role, que el core solo transporta sin interpretar.
+// Análogo a forgenet/csharp/NetworkCore.Tests/TacaTacaExample.cs.
 package main
 
 import (
@@ -12,10 +14,23 @@ import (
 	"net/http"
 	"sync"
 
-	"nucleo-multiplayer/networkcore"
+	"github.com/mgueregath/ForgeNet/go/networkcore"
 )
 
 const eventTypeGoal = 1
+
+// Roles de taca-taca — opacos para el core, definidos y usados solo acá.
+// roleBoard es el tablero (recibe el mismo snapshot que todos, pero no
+// controla ninguna barra); rolePaddle es un mando/jugador.
+const (
+	roleBoard  uint8 = 0x01
+	rolePaddle uint8 = 0x02
+)
+
+// maxPaddles: cupo de mandos por partida — regla de taca-taca, no del
+// core (Server.MaxPlayersPerRoom es un tope numérico genérico que no
+// distingue roles; este chequeo sí lo hace).
+const maxPaddles = 2
 
 type rodState struct {
 	playerID uint16
@@ -63,9 +78,21 @@ func (s *tacaTacaState) encode() []byte {
 }
 
 func (s *tacaTacaState) attachTo(host *networkcore.NetworkHost) {
-	host.OnPlayerConnected = func(id uint16) {
+	// Role es opaco para el core: acá es donde taca-taca decide qué hacer
+	// con cada valor. El tablero (roleBoard) recibe el mismo snapshot que
+	// todos (ve la partida completa) pero no controla ninguna barra. Un
+	// mando (rolePaddle) más allá del cupo tampoco recibe barra — se queda
+	// conectado, pero sin efecto en el juego (rechazarlo requeriría que el
+	// core soporte desconexión post-admisión, que hoy no tiene).
+	host.OnPlayerConnected = func(id uint16, role uint8) {
+		if role != rolePaddle {
+			return
+		}
 		s.mu.Lock()
 		defer s.mu.Unlock()
+		if len(s.rods) >= maxPaddles {
+			return
+		}
 		s.rods = append(s.rods, &rodState{playerID: id})
 	}
 
@@ -116,28 +143,42 @@ func (s *tacaTacaState) attachTo(host *networkcore.NetworkHost) {
 }
 
 func main() {
-	host := networkcore.NewNetworkHost()
-	state := &tacaTacaState{}
-	state.attachTo(host)
+	// roomFactory: se llama una vez por sala creada (Server.HandshakeModeCreate)
+	// — cada partida de taca-taca es independiente, con su propio estado
+	// (pelota, score, barras). El Server no sabe nada de esto: solo llama
+	// a la factory y le rutea paquetes a lo que devuelve.
+	roomFactory := func() *networkcore.NetworkHost {
+		host := networkcore.NewNetworkHost()
+		state := &tacaTacaState{}
+		state.attachTo(host)
+		return host
+	}
+
+	// MaxPlayersPerRoom es el tope genérico del Server (cuenta clientes,
+	// sin distinguir roles) — para taca-taca da igual a maxPaddles+1
+	// (tablero). El cupo específico por rol (2 barras exactas) lo aplica
+	// tacaTacaState.attachTo arriba.
+	server := networkcore.NewServer(roomFactory, networkcore.ServerOptions{
+		MaxPlayersPerRoom: maxPaddles + 1,
+	})
 
 	// Transporte UDP — clientes nativos (ej. Unity).
-	if err := host.Start(9999); err != nil {
+	if err := server.StartUDP(9999); err != nil {
 		log.Fatalf("error arrancando UDP: %v", err)
 	}
 
-	// Transporte WebTransport — clientes de navegador. Mismo host, misma
-	// partida: un cliente UDP y uno de navegador conectados a la vez
-	// terminan jugando juntos (ver TestUDPAndWebTransportSamePlayerSpace
-	// en networkcore).
-	devCert, err := host.StartWebTransport(networkcore.WebTransportOptions{Addr: ":9443"})
+	// Transporte WebTransport — clientes de navegador. Mismo Server, así
+	// que un cliente UDP y uno de navegador pueden terminar en la misma
+	// sala (ver TestUDPAndWebTransportSamePlayerSpace en networkcore).
+	devCert, err := server.StartWebTransport(networkcore.WebTransportOptions{Addr: ":9443"})
 	if err != nil {
 		log.Fatalf("error arrancando WebTransport: %v", err)
 	}
 	log.Printf("🔑 Certificate hash (sha-256, base64): %s", devCert.HashBase64)
 
 	// Servidor HTTP aparte, solo para servir la página de prueba del
-	// navegador (nucleo-multiplayer/web/) y exponer el hash del
-	// certificado dev sin tener que copiarlo a mano.
+	// navegador (forgenet/web/) y exponer el hash del certificado dev sin
+	// tener que copiarlo a mano.
 	startBrowserPageServer(devCert.HashBase64)
 
 	select {}
@@ -145,7 +186,7 @@ func main() {
 
 func startBrowserPageServer(certHash string) {
 	const addr = ":8080"
-	const webDir = "../../web" // nucleo-multiplayer/go/ejemplo-tacataca -> nucleo-multiplayer/web
+	const webDir = "../../web" // forgenet/go/ejemplo-tacataca -> forgenet/web
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/certhash", func(w http.ResponseWriter, r *http.Request) {

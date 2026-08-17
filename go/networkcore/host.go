@@ -26,10 +26,13 @@ type Peer interface {
 }
 
 // ClientConnection: estado de sesión de un cliente. No tiene ningún campo
-// de estado de juego — eso vive en el juego, no acá.
+// de estado de juego — eso vive en el juego, no acá. Role es opaco: el core
+// lo guarda y lo expone (ver GetClientRole) pero nunca lo interpreta — cada
+// juego define sus propios valores y qué significan.
 type ClientConnection struct {
 	PlayerID      uint16
 	Peer          Peer
+	Role          uint8
 	LastSeq       uint32
 	LastHeartbeat time.Time
 	Ping          int
@@ -45,10 +48,12 @@ type reliableMessage struct {
 	Retries uint8
 }
 
-// NetworkHost: rol "servidor" del protocolo. No sabe nada del juego que
-// corre encima — se engancha vía los campos de callback de abajo, igual
-// que NetworkHost en el core de C#. Tampoco sabe de qué transporte vienen
-// los paquetes (UDP, WebTransport, o ambos a la vez) — ver Peer.
+// NetworkHost: rol "servidor" del protocolo para UNA sala/partida. No sabe
+// nada del juego que corre encima — se engancha vía los campos de callback
+// de abajo, igual que NetworkHost en el core de C#. Tampoco sabe de qué
+// transporte vienen los paquetes (UDP, WebTransport, o ambos a la vez) — ver
+// Peer — ni a qué sala pertenece: eso lo decide Server, que crea una
+// instancia de NetworkHost por sala y le rutea sus paquetes (ver server.go).
 type NetworkHost struct {
 	clients      map[uint16]*ClientConnection
 	clientsByKey map[string]*ClientConnection // key = Peer.Key()
@@ -66,11 +71,8 @@ type NetworkHost struct {
 	running    bool
 	loopsOnce  sync.Once
 
-	closers    []func()
-	closersMux sync.Mutex
-
 	// --- Hooks genéricos: acá es donde el juego se engancha ---
-	OnPlayerConnected    func(playerID uint16)
+	OnPlayerConnected    func(playerID uint16, role uint8)
 	OnPlayerDisconnected func(playerID uint16)
 	OnInput              func(input PlayerInput)
 	OnTick               func(tick uint64)
@@ -87,37 +89,17 @@ func NewNetworkHost() *NetworkHost {
 	}
 }
 
-// Stop detiene los loops de fondo (tick, retransmisión, heartbeat) y cierra
-// todos los transportes activos (sockets UDP, listener WebTransport) —
-// cualquier transporte que se haya registrado vía registerCloser.
+// Stop detiene los loops de fondo de esta sala (tick, retransmisión,
+// heartbeat). No toca ningún transporte — eso es responsabilidad de Server,
+// que es quien los posee (ver server.go).
 func (h *NetworkHost) Stop() {
 	h.running = false
-
-	h.closersMux.Lock()
-	closers := h.closers
-	h.closers = nil
-	h.closersMux.Unlock()
-
-	for _, close := range closers {
-		close()
-	}
 }
 
-// registerCloser: cada transporte (StartUDP, StartWebTransport) registra
-// acá cómo cerrarse, para que Stop() pueda desbloquear sus loops de
-// recepción (ej. un ReadFromUDP bloqueado no se entera de que running
-// pasó a false hasta que el socket se cierra).
-func (h *NetworkHost) registerCloser(closeFn func()) {
-	h.closersMux.Lock()
-	defer h.closersMux.Unlock()
-	h.closers = append(h.closers, closeFn)
-}
-
-// ensureLoopsStarted arranca el tick loop, la retransmisión de confiables y
-// el heartbeat — comunes a cualquier transporte. Es seguro llamarlo desde
-// StartUDP y StartWebTransport a la vez: sync.Once garantiza que los loops
-// arrancan una sola vez sin importar cuántos transportes se agreguen.
-func (h *NetworkHost) ensureLoopsStarted() {
+// start arranca el tick loop, la retransmisión de confiables y el
+// heartbeat de esta sala. La llama Server exactamente una vez, al crear la
+// sala (ver Server.createRoom) — sync.Once es solo una salvaguarda.
+func (h *NetworkHost) start() {
 	h.loopsOnce.Do(func() {
 		h.running = true
 		go h.gameLoop()
@@ -142,10 +124,10 @@ func (h *NetworkHost) ConnectedPlayerCount() int {
 
 // --- Recepción: punto de entrada común para cualquier transporte ---
 
-// HandlePacket procesa un paquete crudo recibido de un Peer. Cada
-// transporte (UDP, WebTransport) llama a esto por cada paquete que recibe
-// — es la única puerta de entrada al protocolo, sin importar de dónde
-// vino el paquete.
+// HandlePacket procesa un paquete crudo recibido de un Peer que YA
+// pertenece a esta sala. El handshake no pasa por acá: es Server quien lo
+// intercepta primero para decidir a qué sala corresponde (crear una nueva o
+// unirse a una existente) y recién ahí llama a AdmitPlayer — ver server.go.
 func (h *NetworkHost) HandlePacket(data []byte, peer Peer) {
 	seq, _, packetType, flags, ok := parseHeader(data)
 	if !ok {
@@ -153,8 +135,6 @@ func (h *NetworkHost) HandlePacket(data []byte, peer Peer) {
 	}
 
 	switch packetType {
-	case PacketHandshake:
-		h.handleHandshake(seq, peer)
 	case PacketInput:
 		h.handleInput(seq, peer, flags, data[HeaderSize:])
 	case PacketAck:
@@ -164,13 +144,21 @@ func (h *NetworkHost) HandlePacket(data []byte, peer Peer) {
 	}
 }
 
-func (h *NetworkHost) handleHandshake(seq uint32, peer Peer) {
+// AdmitPlayer registra un cliente nuevo en esta sala y dispara
+// OnPlayerConnected(playerID, role). La llama Server, después de decidir
+// (crear/unirse) a qué sala pertenece el cliente. Role es opaco para el
+// core — cada juego define sus propios valores y qué hacer con ellos (ej.
+// no crear una "barra" de juego para el rol que representa al tablero).
+// Idempotente: un cliente que ya está admitido devuelve su PlayerID actual
+// sin duplicar estado (cubre el reintento de un handshake cuyo ack se
+// perdió).
+func (h *NetworkHost) AdmitPlayer(peer Peer, role uint8) uint16 {
 	key := peer.Key()
 
 	h.clientsMux.Lock()
-	if _, exists := h.clientsByKey[key]; exists {
+	if existing, exists := h.clientsByKey[key]; exists {
 		h.clientsMux.Unlock()
-		return
+		return existing.PlayerID
 	}
 
 	playerID := h.nextPlayerID
@@ -179,7 +167,7 @@ func (h *NetworkHost) handleHandshake(seq uint32, peer Peer) {
 	client := &ClientConnection{
 		PlayerID:      playerID,
 		Peer:          peer,
-		LastSeq:       seq,
+		Role:          role,
 		LastHeartbeat: time.Now(),
 		Connected:     true,
 	}
@@ -187,13 +175,23 @@ func (h *NetworkHost) handleHandshake(seq uint32, peer Peer) {
 	h.clientsByKey[key] = client
 	h.clientsMux.Unlock()
 
-	response := buildHeader(seq, 0, PacketHandshake, 0)
-	response = append(response, byte(playerID>>8), byte(playerID))
-	peer.Send(response)
-
 	if h.OnPlayerConnected != nil {
-		h.OnPlayerConnected(playerID)
+		h.OnPlayerConnected(playerID, role)
 	}
+	return playerID
+}
+
+// GetClientRole devuelve el rol opaco con el que se admitió a un jugador
+// (ver AdmitPlayer). ok=false si el jugador no existe (ya desconectado, o
+// ID inválido).
+func (h *NetworkHost) GetClientRole(playerID uint16) (role uint8, ok bool) {
+	h.clientsMux.RLock()
+	defer h.clientsMux.RUnlock()
+	client, exists := h.clients[playerID]
+	if !exists {
+		return 0, false
+	}
+	return client.Role, true
 }
 
 func (h *NetworkHost) handleInput(seq uint32, peer Peer, flags byte, payload []byte) {

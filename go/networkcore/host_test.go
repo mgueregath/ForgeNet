@@ -16,6 +16,7 @@ type testClient struct {
 	conn     *net.UDPConn
 	addr     *net.UDPAddr
 	playerID uint16
+	roomCode string
 	seq      uint32
 }
 
@@ -55,10 +56,24 @@ func itoa(n int) string {
 	return string(buf[i:])
 }
 
-func (c *testClient) handshake(t *testing.T) {
+// handshake crea una sala nueva (HandshakeModeCreate). role es opaco para
+// el core — estos tests usan valores arbitrarios, ningún significado.
+func (c *testClient) handshake(t *testing.T, role uint8) {
+	t.Helper()
+	c.joinOrCreate(t, HandshakeModeCreate, role, "")
+}
+
+// join se une a una sala existente por código (HandshakeModeJoin).
+func (c *testClient) join(t *testing.T, role uint8, roomCode string) {
+	t.Helper()
+	c.joinOrCreate(t, HandshakeModeJoin, role, roomCode)
+}
+
+func (c *testClient) joinOrCreate(t *testing.T, mode, role uint8, roomCode string) {
 	t.Helper()
 	c.conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	req := buildHeader(0, 0, PacketHandshake, 0)
+	payload := EncodeJoinPayload(mode, role, roomCode)
+	req := append(buildHeader(0, 0, PacketHandshake, 0), payload...)
 	if _, err := c.conn.Write(req); err != nil {
 		t.Fatal(err)
 	}
@@ -68,10 +83,42 @@ func (c *testClient) handshake(t *testing.T) {
 	if err != nil {
 		t.Fatalf("handshake sin respuesta: %v", err)
 	}
-	if n < 11 {
+	_, _, packetType, _, ok := parseHeader(buf[:n])
+	if !ok {
+		t.Fatalf("respuesta de handshake malformada")
+	}
+	if packetType == PacketDisconnect {
+		t.Fatalf("handshake rechazado, reason=%d", buf[HeaderSize])
+	}
+	if n < HeaderSize+3 {
 		t.Fatalf("respuesta de handshake muy corta: %d bytes", n)
 	}
-	c.playerID = binary.BigEndian.Uint16(buf[9:11])
+	c.playerID = binary.BigEndian.Uint16(buf[HeaderSize : HeaderSize+2])
+	codeLen := int(buf[HeaderSize+2])
+	c.roomCode = string(buf[HeaderSize+3 : HeaderSize+3+codeLen])
+}
+
+// handshakeExpectReject intenta un handshake que se espera que el server
+// rechace (ej. unirse a un código inexistente), y devuelve el motivo.
+func (c *testClient) handshakeExpectReject(t *testing.T, mode, role uint8, roomCode string) byte {
+	t.Helper()
+	c.conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	payload := EncodeJoinPayload(mode, role, roomCode)
+	req := append(buildHeader(0, 0, PacketHandshake, 0), payload...)
+	if _, err := c.conn.Write(req); err != nil {
+		t.Fatal(err)
+	}
+
+	buf := make([]byte, 64)
+	n, err := c.conn.Read(buf)
+	if err != nil {
+		t.Fatalf("sin respuesta: %v", err)
+	}
+	_, _, packetType, _, ok := parseHeader(buf[:n])
+	if !ok || packetType != PacketDisconnect {
+		t.Fatalf("esperaba PacketDisconnect, packetType=%d ok=%v", packetType, ok)
+	}
+	return buf[HeaderSize]
 }
 
 func (c *testClient) sendInput(t *testing.T, dx, dy int16, rot uint16, actions uint32, reliable bool) {
@@ -136,16 +183,20 @@ func TestHandshakeInputSnapshotPing(t *testing.T) {
 		receivedInputs = append(receivedInputs, input)
 	}
 
-	if err := host.Start(29999); err != nil {
+	server := NewServer(func() *NetworkHost { return host }, ServerOptions{})
+	if err := server.StartUDP(29999); err != nil {
 		t.Fatal(err)
 	}
-	defer host.Stop()
+	defer server.Stop()
 	time.Sleep(200 * time.Millisecond)
 
 	client := newTestClient(t, 29999)
-	client.handshake(t)
+	client.handshake(t, 1)
 	if client.playerID == 0 {
 		t.Fatal("playerID no asignado")
+	}
+	if client.roomCode == "" {
+		t.Fatal("no se recibió código de sala")
 	}
 
 	client.sendInput(t, 15, -7, 90, 0, false)
@@ -223,14 +274,15 @@ func TestHeartbeatSurvives10Seconds(t *testing.T) {
 	}
 
 	host := NewNetworkHost()
-	if err := host.Start(29998); err != nil {
+	server := NewServer(func() *NetworkHost { return host }, ServerOptions{})
+	if err := server.StartUDP(29998); err != nil {
 		t.Fatal(err)
 	}
-	defer host.Stop()
+	defer server.Stop()
 	time.Sleep(200 * time.Millisecond)
 
 	client := newTestClient(t, 29998)
-	client.handshake(t)
+	client.handshake(t, 1)
 
 	start := time.Now()
 	for time.Since(start) < 12*time.Second {
@@ -240,5 +292,129 @@ func TestHeartbeatSurvives10Seconds(t *testing.T) {
 
 	if host.ConnectedPlayerCount() != 1 {
 		t.Fatalf("cliente se desconectó tras 12s de actividad (bug de heartbeat reintroducido)")
+	}
+}
+
+// TestCreateAndJoinRoom prueba el flujo genérico de salas: un cliente crea
+// una sala (sin código todavía) y recibe uno; otro cliente se une con ese
+// código y termina en la MISMA sala (mismo NetworkHost) que el primero —
+// sin que el core sepa nada de qué juego es ni de qué son los clientes.
+func TestCreateAndJoinRoom(t *testing.T) {
+	var created []*NetworkHost
+	factory := func() *NetworkHost {
+		h := NewNetworkHost()
+		created = append(created, h)
+		return h
+	}
+	server := NewServer(factory, ServerOptions{})
+	if err := server.StartUDP(29997); err != nil {
+		t.Fatal(err)
+	}
+	defer server.Stop()
+	time.Sleep(200 * time.Millisecond)
+
+	creator := newTestClient(t, 29997)
+	creator.handshake(t, 1)
+	if creator.roomCode == "" {
+		t.Fatal("el creador no recibió código de sala")
+	}
+
+	joiner := newTestClient(t, 29997)
+	joiner.join(t, 2, creator.roomCode)
+
+	if joiner.roomCode != creator.roomCode {
+		t.Fatalf("joiner terminó en otra sala: %q vs %q", joiner.roomCode, creator.roomCode)
+	}
+	if creator.playerID == joiner.playerID {
+		t.Fatalf("ambos clientes recibieron el mismo PlayerID (%d)", creator.playerID)
+	}
+	if len(created) != 1 {
+		t.Fatalf("se creó más de una sala (%d) para un solo Create + un solo Join", len(created))
+	}
+	if got := created[0].ConnectedPlayerCount(); got != 2 {
+		t.Fatalf("esperaba 2 clientes en la sala, hay %d", got)
+	}
+}
+
+// TestJoinNonexistentRoomRejected: unirse a un código que no existe debe
+// rechazarse con PacketDisconnect/ReasonRoomNotFound, sin crear nada.
+func TestJoinNonexistentRoomRejected(t *testing.T) {
+	server := NewServer(func() *NetworkHost { return NewNetworkHost() }, ServerOptions{})
+	if err := server.StartUDP(29996); err != nil {
+		t.Fatal(err)
+	}
+	defer server.Stop()
+	time.Sleep(200 * time.Millisecond)
+
+	client := newTestClient(t, 29996)
+	reason := client.handshakeExpectReject(t, HandshakeModeJoin, 1, "ZZZZZZ")
+	if reason != ReasonRoomNotFound {
+		t.Fatalf("reason=%d, esperaba ReasonRoomNotFound(%d)", reason, ReasonRoomNotFound)
+	}
+}
+
+// TestMaxPlayersPerRoomRejectsExtraJoins: el tope es puramente numérico —
+// el Server no sabe qué rol tiene cada cliente, solo cuenta.
+func TestMaxPlayersPerRoomRejectsExtraJoins(t *testing.T) {
+	server := NewServer(func() *NetworkHost { return NewNetworkHost() }, ServerOptions{MaxPlayersPerRoom: 2})
+	if err := server.StartUDP(29995); err != nil {
+		t.Fatal(err)
+	}
+	defer server.Stop()
+	time.Sleep(200 * time.Millisecond)
+
+	creator := newTestClient(t, 29995)
+	creator.handshake(t, 1)
+
+	second := newTestClient(t, 29995)
+	second.join(t, 1, creator.roomCode)
+
+	third := newTestClient(t, 29995)
+	reason := third.handshakeExpectReject(t, HandshakeModeJoin, 1, creator.roomCode)
+	if reason != ReasonRoomFull {
+		t.Fatalf("reason=%d, esperaba ReasonRoomFull(%d)", reason, ReasonRoomFull)
+	}
+}
+
+// TestRoleIsOpaqueButExposed: el core no interpreta Role, pero lo guarda y
+// lo pasa a OnPlayerConnected y a GetClientRole — de ahí en más es 100%
+// decisión del juego qué hacer con ese valor.
+func TestRoleIsOpaqueButExposed(t *testing.T) {
+	host := NewNetworkHost()
+
+	var mu sync.Mutex
+	gotRoles := map[uint16]uint8{}
+	host.OnPlayerConnected = func(playerID uint16, role uint8) {
+		mu.Lock()
+		defer mu.Unlock()
+		gotRoles[playerID] = role
+	}
+
+	server := NewServer(func() *NetworkHost { return host }, ServerOptions{})
+	if err := server.StartUDP(29994); err != nil {
+		t.Fatal(err)
+	}
+	defer server.Stop()
+	time.Sleep(200 * time.Millisecond)
+
+	const roleA, roleB uint8 = 7, 42
+	clientA := newTestClient(t, 29994)
+	clientA.handshake(t, roleA)
+	clientB := newTestClient(t, 29994)
+	clientB.join(t, roleB, clientA.roomCode)
+
+	time.Sleep(100 * time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if gotRoles[clientA.playerID] != roleA {
+		t.Errorf("rol de A: got %d, want %d", gotRoles[clientA.playerID], roleA)
+	}
+	if gotRoles[clientB.playerID] != roleB {
+		t.Errorf("rol de B: got %d, want %d", gotRoles[clientB.playerID], roleB)
+	}
+
+	if role, ok := host.GetClientRole(clientA.playerID); !ok || role != roleA {
+		t.Errorf("GetClientRole(A) = %d, %v — want %d, true", role, ok, roleA)
 	}
 }

@@ -1,4 +1,4 @@
-module nucleo-multiplayer
+module github.com/mgueregath/ForgeNet/go
 
 go 1.26.3
 
