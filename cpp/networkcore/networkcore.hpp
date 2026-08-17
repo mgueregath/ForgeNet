@@ -305,6 +305,15 @@ public:
         return std::string(ip) + ":" + std::to_string(ntohs(addr_.sin_port));
     }
 
+    // Solo la IP (sin el puerto, que cambia en cada reconexión — nuevo
+    // socket UDP). admit_player la usa como heurística para reconocer "es
+    // el mismo dispositivo reconectándose" — ver el comentario grande ahí.
+    std::string ip() const {
+        char ip[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &addr_.sin_addr, ip, sizeof(ip));
+        return std::string(ip);
+    }
+
     const struct sockaddr_in& addr() const { return addr_; }
 
 private:
@@ -344,7 +353,10 @@ struct ClientConnection {
 // (ver más abajo).
 class NetworkHost {
 public:
-    std::function<void(uint16_t, uint8_t)> on_player_connected;
+    // reconnected=true si esto fue una reconexión reconocida por IP (ver
+    // admit_player) — el juego puede usarlo para NO pisar el estado que ya
+    // tenía ese jugador con uno vacío.
+    std::function<void(uint16_t, uint8_t, bool)> on_player_connected;
     std::function<void(uint16_t)> on_player_disconnected;
     std::function<void(const PlayerInput&)> on_input;
     std::function<void(uint64_t)> on_tick;
@@ -391,22 +403,57 @@ public:
         }
     }
 
-    // Registra un cliente nuevo en esta sala y dispara
-    // on_player_connected(player_id, role). La llama Server, después de
-    // decidir (crear/unirse) a qué sala pertenece el cliente. Idempotente:
-    // un cliente que ya está admitido devuelve su player_id actual sin
-    // duplicar estado (cubre el reintento de un handshake cuyo ack se
-    // perdió).
-    uint16_t admit_player(const Peer& peer, uint8_t role) {
+    // Registra un cliente nuevo en esta sala, o reconoce una reconexión, y
+    // dispara on_player_connected(player_id, role, reconnected). La llama
+    // Server, después de decidir (crear/unirse) a qué sala pertenece el
+    // cliente. role es opaco para el core.
+    //
+    // Reconexión: si hay un cliente marcado desconectado (ver
+    // heartbeat_loop) con la misma IP (Peer::ip()) que quien está haciendo
+    // el handshake, se le devuelve la MISMA identidad (player_id, y el role
+    // ORIGINAL — no el que venga en este handshake, para no perder de vista
+    // quién era) en vez de crear un jugador nuevo. Es una heurística por
+    // IP, no un token de sesión (el protocolo no lleva uno todavía): no es
+    // a prueba de balas si dos jugadores comparten la misma IP pública (NAT
+    // compartido) y ambos están desconectados a la vez.
+    //
+    // Idempotente además en el sentido de siempre: un cliente que ya está
+    // admitido (mismo Peer::key(), sin pasar por desconexión) devuelve su
+    // player_id actual sin duplicar estado ni disparar el hook de nuevo
+    // (cubre el reintento de un handshake cuyo ack se perdió).
+    std::pair<uint16_t, bool> admit_player(const Peer& peer, uint8_t role) {
         std::string key = peer.key();
         uint16_t player_id;
-        bool is_new = false;
+        uint8_t effective_role = role;
+        bool reconnected = false;
 
         {
             std::lock_guard<std::mutex> lock(clients_mutex_);
             auto it = clients_by_key_.find(key);
             if (it != clients_by_key_.end()) {
-                player_id = it->second;
+                return {it->second, false};
+            }
+
+            ClientConnection* reclaimed = nullptr;
+            std::string ip = peer.ip();
+            if (!ip.empty()) {
+                for (auto& [id, c] : clients_) {
+                    if (!c.connected && c.peer.ip() == ip) {
+                        reclaimed = &c;
+                        break;
+                    }
+                }
+            }
+
+            if (reclaimed) {
+                clients_by_key_.erase(reclaimed->peer.key());
+                reclaimed->peer = peer;
+                reclaimed->connected = true;
+                reclaimed->last_heartbeat = std::chrono::steady_clock::now();
+                clients_by_key_[key] = reclaimed->player_id;
+                player_id = reclaimed->player_id;
+                effective_role = reclaimed->role;
+                reconnected = true;
             } else {
                 player_id = next_player_id_.fetch_add(1);
                 ClientConnection client;
@@ -417,12 +464,11 @@ public:
                 client.connected = true;
                 clients_[player_id] = std::move(client);
                 clients_by_key_[key] = player_id;
-                is_new = true;
             }
         }
 
-        if (is_new && on_player_connected) on_player_connected(player_id, role);
-        return player_id;
+        if (on_player_connected) on_player_connected(player_id, effective_role, reconnected);
+        return {player_id, reconnected};
     }
 
     // Devuelve el rol opaco con el que se admitió a un jugador (ver
@@ -485,9 +531,16 @@ public:
         return it->second.reliable_queue.size();
     }
 
+    // Solo cuenta connected==true — clients_ también incluye clientes
+    // desconectados que quedaron "reclamables" para una reconexión (ver
+    // heartbeat_loop/admit_player), así que clients_.size() ya no alcanza.
     size_t connected_player_count() {
         std::lock_guard<std::mutex> lock(clients_mutex_);
-        return clients_.size();
+        size_t n = 0;
+        for (auto& [id, c] : clients_) {
+            if (c.connected) n++;
+        }
+        return n;
     }
 
 private:
@@ -652,9 +705,17 @@ private:
                         to_remove.push_back(id);
                     }
                 }
+                // Solo se marca connected=false — a propósito NO se borra
+                // de clients_: se mantiene "reclamable" por admit_player si
+                // el mismo dispositivo (misma IP) vuelve a conectarse, así
+                // el juego puede restaurar su estado en vez de tratarlo
+                // como uno nuevo. clients_by_key_ sí se limpia: esa key (ej.
+                // ip:puerto UDP viejo) ya no sirve para rutear nada. Server,
+                // por su lado, no destruye la sala instantáneamente al
+                // quedar en 0 conectados — ver ServerOptions::empty_room_grace_period.
                 for (auto id : to_remove) {
+                    clients_[id].connected = false;
                     clients_by_key_.erase(clients_[id].peer.key());
-                    clients_.erase(id);
                 }
             }
 
@@ -694,6 +755,11 @@ struct ServerOptions {
     // loop o un flood simple desde una única conexión.
     int handshake_rate_limit = 10;
     std::chrono::milliseconds handshake_rate_limit_window{10000};
+    // Cuánto se espera, desde que una sala que ya tuvo jugadores queda en 0
+    // conectados, antes de destruirla — no instantáneo, para darle tiempo a
+    // admit_player de reconocer una reconexión (ver el comentario grande
+    // ahí) antes de que la sala misma deje de existir. Default: 30s.
+    std::chrono::seconds empty_room_grace_period{30};
 };
 
 // roomCodeAlphabet excluye 0/O y 1/I — ambiguos al leerlos a mano si el QR
@@ -729,6 +795,10 @@ public:
     // Arranca el transporte UDP y el janitor de fondo. No hay
     // StartWebTransport en este puerto — este proyecto en C++ solo
     // implementa el transporte UDP (ver README: "Dedicated Server" POSIX).
+    //
+    // port=0 le pide al SO cualquier puerto disponible — útil para un
+    // deployment que no quiere depender de que un puerto fijo esté libre.
+    // El puerto real que asignó el SO queda disponible en udp_port().
     bool start_udp(uint16_t port) {
         socket_fd_ = socket(AF_INET, SOCK_DGRAM, 0);
         if (socket_fd_ < 0) return false;
@@ -746,13 +816,27 @@ public:
         addr.sin_port = htons(port);
         if (bind(socket_fd_, (struct sockaddr*)&addr, sizeof(addr)) < 0) return false;
 
+        struct sockaddr_in bound_addr{};
+        socklen_t bound_len = sizeof(bound_addr);
+        if (getsockname(socket_fd_, (struct sockaddr*)&bound_addr, &bound_len) == 0) {
+            udp_port_ = ntohs(bound_addr.sin_port);
+        } else {
+            udp_port_ = port;
+        }
+
         running_ = true;
         threads_.emplace_back(&Server::receive_loop, this);
         threads_.emplace_back(&Server::janitor_loop, this);
 
-        std::cout << "🌐 Server escuchando en :" << port << " (multi-sala)" << std::endl;
+        std::cout << "🌐 Server escuchando en :" << udp_port_ << " (multi-sala)" << std::endl;
         return true;
     }
+
+    // Puerto UDP real en el que quedó escuchando el server — el mismo que
+    // se pidió en start_udp, salvo que se haya pedido 0 (cualquiera
+    // disponible), en cuyo caso es el que el SO asignó de verdad. 0 si
+    // start_udp nunca se llamó (o falló).
+    uint16_t udp_port() const { return udp_port_; }
 
     // Cierra el transporte y detiene todas las salas.
     void stop() {
@@ -802,11 +886,33 @@ public:
         host->handle_packet(data, len, peer);
     }
 
+    // Arranca una sala directamente, sin pasar por un handshake de red — a
+    // diferencia de una sala creada porque un cliente mandó
+    // HANDSHAKE_MODE_CREATE, acá no hay ningún cliente admitido todavía.
+    //
+    // Pensado para el modo "host embebido" (ej. un tablero en LAN, que es
+    // el mismo proceso que corre el Server): la app llama a esto una vez al
+    // arrancar y ya tiene una sala fija a la que los mandos se unen por
+    // HANDSHAKE_MODE_JOIN, sin que el propio tablero tenga que hacerse
+    // pasar por cliente de sí mismo para "crear" la sala. La sala recién
+    // creada NO cuenta como "vacía" para el janitor (ver
+    // sweep_empty_rooms/had_player) hasta que admite a su primer cliente de
+    // verdad, así que puede esperar indefinidamente a que alguien se una
+    // sin que empty_room_grace_period la destruya.
+    std::string create_room() {
+        return create_room_internal().first;
+    }
+
 private:
     struct Room {
         std::string code;
         std::shared_ptr<NetworkHost> host;
         bool had_player = false;
+        // Desde cuándo connected_player_count() está en 0 — sin setear
+        // mientras la sala tiene al menos un cliente conectado. Ver
+        // sweep_empty_rooms.
+        bool empty_since_set = false;
+        std::chrono::steady_clock::time_point empty_since{};
     };
 
     // Recuerda a qué sala pertenece cada Peer y guarda el último ack de
@@ -827,6 +933,7 @@ private:
     RoomFactory room_factory_;
 
     int socket_fd_ = -1;
+    std::atomic<uint16_t> udp_port_{0};
     std::atomic<bool> running_{false};
     std::vector<std::thread> threads_;
 
@@ -884,7 +991,7 @@ private:
         std::string final_code;
 
         if (mode == HANDSHAKE_MODE_CREATE) {
-            std::tie(final_code, host) = create_room();
+            std::tie(final_code, host) = create_room_internal();
         } else if (mode == HANDSHAKE_MODE_JOIN) {
             std::lock_guard<std::mutex> lock(mu_);
             auto it = rooms_.find(room_code);
@@ -911,7 +1018,7 @@ private:
             return;
         }
 
-        uint16_t player_id = host->admit_player(peer, role);
+        uint16_t player_id = host->admit_player(peer, role).first;
 
         {
             std::lock_guard<std::mutex> lock(mu_);
@@ -955,13 +1062,16 @@ private:
         }
     }
 
-    std::pair<std::string, std::shared_ptr<NetworkHost>> create_room() {
+    std::pair<std::string, std::shared_ptr<NetworkHost>> create_room_internal() {
         std::string code = generate_unique_room_code();
         auto host = room_factory_();
         host->start();
 
         std::lock_guard<std::mutex> lock(mu_);
-        rooms_[code] = Room{code, host, false};
+        Room r;
+        r.code = code;
+        r.host = host;
+        rooms_[code] = std::move(r);
         return {code, host};
     }
 
@@ -992,14 +1102,30 @@ private:
         }
     }
 
+    // Destruye salas que se quedaron sin ningún cliente conectado durante
+    // más de opts_.empty_room_grace_period — no instantáneo, para darle
+    // tiempo a admit_player de reconocer una reconexión (ver el comentario
+    // grande ahí). Una sala que nunca tuvo un cliente (had_player=false,
+    // ej. creada por Server::create_room para el modo "host embebido") no
+    // se toca nunca acá.
     void sweep_empty_rooms() {
         std::vector<std::pair<std::string, std::shared_ptr<NetworkHost>>> to_remove;
+        auto now = std::chrono::steady_clock::now();
         {
             std::lock_guard<std::mutex> lock(mu_);
             for (auto& [code, r] : rooms_) {
-                if (r.had_player && r.host->connected_player_count() == 0) {
-                    to_remove.emplace_back(code, r.host);
+                if (!r.had_player) continue;
+                if (r.host->connected_player_count() > 0) {
+                    r.empty_since_set = false;
+                    continue;
                 }
+                if (!r.empty_since_set) {
+                    r.empty_since = now;
+                    r.empty_since_set = true;
+                    continue;
+                }
+                if (now - r.empty_since < opts_.empty_room_grace_period) continue;
+                to_remove.emplace_back(code, r.host);
             }
             for (auto& [code, host] : to_remove) {
                 rooms_.erase(code);

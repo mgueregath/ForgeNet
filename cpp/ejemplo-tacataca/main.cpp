@@ -79,7 +79,7 @@ public:
         // recibe barra — se queda conectado, pero sin efecto en el juego
         // (rechazarlo requeriría que el core soporte desconexión
         // post-admisión, que hoy no tiene).
-        host.on_player_connected = [this](uint16_t id, uint8_t role) {
+        host.on_player_connected = [this](uint16_t id, uint8_t role, bool /*reconnected*/) {
             if (role != ROLE_PADDLE) return;
             std::lock_guard<std::mutex> lock(mutex_);
             if (state_.rods.size() >= MAX_PADDLES) return;

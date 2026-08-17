@@ -319,11 +319,151 @@ void test_join_nonexistent_room_rejected() {
     server.stop();
 }
 
+// Test 5: un cliente que se cae (deja de mandar heartbeat) y vuelve a
+// conectarse desde la misma IP a la misma sala recibe el mismo player_id y
+// el role ORIGINAL — no el nuevo que mande en el segundo handshake — ver
+// el comentario grande en NetworkHost::admit_player. Mirror de
+// TestReconnectionByIPPreservesIdentity (Go).
+void test_reconnection_by_ip_preserves_identity() {
+    std::cout << std::endl << "== Test 5: reconexión por IP preserva identidad y role original ==" << std::endl;
+
+    auto host = std::make_shared<NetworkHost>();
+    std::mutex cb_mutex;
+    std::vector<uint16_t> player_ids;
+    std::vector<bool> reconnected_flags;
+    host->on_player_connected = [&](uint16_t id, uint8_t, bool reconnected) {
+        std::lock_guard<std::mutex> lock(cb_mutex);
+        player_ids.push_back(id);
+        reconnected_flags.push_back(reconnected);
+    };
+
+    Server server([&]() { return host; }, ServerOptions{});
+    check("server arrancó", server.start_udp(49995));
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+    uint16_t first_id = 0;
+    std::string room_code;
+    {
+        TestClient first(49995);
+        check("primer cliente conecta con role=7", first.handshake(7));
+        first_id = first.player_id_;
+        room_code = first.room_code_;
+    } // el socket se cierra acá — simula la caída: deja de mandar heartbeat
+
+    // Esperar más que heartbeat_timeout (10s hardcodeado en heartbeat_loop,
+    // igual que heartbeatTimeout en el core Go) para que el server marque
+    // al primer cliente como desconectado (pero reclamable). Margen extra
+    // (2s) porque heartbeat_loop solo chequea una vez por segundo.
+    std::this_thread::sleep_for(std::chrono::milliseconds(12000));
+
+    TestClient second(49995);
+    check("segundo cliente se reconecta con role distinto (3, debe ignorarse)", second.join(3, room_code));
+    check("reconexión preservó el player_id", second.player_id_ == first_id);
+
+    {
+        std::lock_guard<std::mutex> lock(cb_mutex);
+        check("hubo 2 llamadas a on_player_connected", reconnected_flags.size() == 2);
+        if (reconnected_flags.size() == 2) {
+            check("la primera conexión no se marcó reconnected", !reconnected_flags[0]);
+            check("la segunda conexión se reconoció como reconnected", reconnected_flags[1]);
+        }
+    }
+
+    auto role = host->get_client_role(first_id);
+    check("el role tras reconexión es el ORIGINAL (7), no el de la reconexión (3)",
+          role.has_value() && *role == 7);
+
+    server.stop();
+}
+
+// Test 6: pedir el puerto 0 le deja al SO elegir uno libre, y udp_port()
+// debe devolver cuál asignó de verdad (no 0). Mirror de TestUDPPortEphemeral
+// (Go).
+void test_udp_port_ephemeral() {
+    std::cout << std::endl << "== Test 6: puerto UDP efímero (port=0) ==" << std::endl;
+
+    Server server([]() { return std::make_shared<NetworkHost>(); }, ServerOptions{});
+    check("server arrancó con port=0", server.start_udp(0));
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+    check("udp_port() devolvió un puerto real (!= 0)", server.udp_port() != 0);
+
+    TestClient client(server.udp_port());
+    check("handshake contra el puerto efímero funciona", client.handshake(1));
+    check("playerId asignado", client.player_id_ > 0);
+
+    server.stop();
+}
+
+// Test 7: modo "host embebido" — la sala existe de entrada, vía
+// Server::create_room(), sin ningún cliente todavía, y un cliente se une
+// después por HANDSHAKE_MODE_JOIN, igual que a cualquier otra sala. Mirror
+// de TestEmbeddedHostMode (Go).
+void test_embedded_host_mode() {
+    std::cout << std::endl << "== Test 7: modo host embebido (Server::create_room) ==" << std::endl;
+
+    std::vector<uint8_t> fake_state = {9, 9, 9};
+    RoomFactory factory = [&]() {
+        auto h = std::make_shared<NetworkHost>();
+        h->state_provider = [&]() { return fake_state; };
+        return h;
+    };
+
+    Server server(factory, ServerOptions{});
+    check("server arrancó", server.start_udp(49994));
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+    std::string room_code = server.create_room();
+    check("create_room() devolvió un código de sala", !room_code.empty());
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+    TestClient mando(49994);
+    check("el mando se une a la sala pre-creada", mando.join(1, room_code));
+    check("playerId asignado", mando.player_id_ > 0);
+    check("el mando terminó en la sala correcta", mando.room_code_ == room_code);
+
+    server.stop();
+}
+
+// Test 8: una sala pre-creada (modo host embebido) que todavía no admitió a
+// nadie no debe destruirse nunca por el janitor, sin importar cuánto pase
+// — el tablero puede quedarse esperando en el lobby indefinidamente. Solo
+// empieza a correr empty_room_grace_period una vez que la sala tuvo al
+// menos un cliente (ver had_player). Mirror de
+// TestEmbeddedHostRoomSurvivesEmptyGracePeriod (Go).
+void test_embedded_host_room_survives_empty_grace_period() {
+    std::cout << std::endl << "== Test 8: sala host-embebido sobrevive vacía más allá del grace period ==" << std::endl;
+
+    ServerOptions opts;
+    opts.empty_room_grace_period = std::chrono::seconds(1); // corto a propósito
+
+    Server server([]() { return std::make_shared<NetworkHost>(); }, opts);
+    check("server arrancó", server.start_udp(49993));
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+    std::string room_code = server.create_room();
+
+    // Esperar bastante más que el grace period (1s) Y que un ciclo del
+    // janitor (5s, fijo en janitor_loop) — si la sala recién creada, sin
+    // ningún cliente aún, fuera tratada igual que una vacía-tras-tener-
+    // gente, el janitor ya la habría destruido acá.
+    std::this_thread::sleep_for(std::chrono::seconds(7));
+
+    TestClient client(49993);
+    check("la sala pre-creada sobrevivió la espera", client.join(1, room_code));
+
+    server.stop();
+}
+
 int main() {
     test_generic_mechanisms();
     test_heartbeat_survives();
     test_create_and_join_room();
     test_join_nonexistent_room_rejected();
+    test_reconnection_by_ip_preserves_identity();
+    test_udp_port_ephemeral();
+    test_embedded_host_mode();
+    test_embedded_host_room_survives_empty_grace_period();
 
     std::cout << std::endl;
     if (failures == 0) {
