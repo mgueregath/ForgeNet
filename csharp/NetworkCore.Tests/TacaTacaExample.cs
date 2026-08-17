@@ -118,7 +118,7 @@ namespace NetworkCore.Tests
             // controla ninguna barra. Un mando (TacaTacaRoles.Paddle) más
             // allá del cupo tampoco recibe barra — se queda conectado, pero
             // sin efecto en el juego.
-            host.OnPlayerConnected += (id, role) =>
+            host.OnPlayerConnected += (id, role, reconnected) =>
             {
                 if (role != TacaTacaRoles.Paddle) return;
                 lock (_lock)

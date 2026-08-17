@@ -285,6 +285,152 @@ Console.WriteLine("== Test 4: ejemplo taca-taca sobre el core genérico ==");
     server.Stop();
 }
 
+// ---------------------------------------------------------------------
+// Test 5: reconexión por IP. Simula un cliente que se cae sin avisar (el
+// socket se cierra pero nunca manda un disconnect explícito) y vuelve a
+// conectarse desde la misma IP antes de que la sala lo purgue — debe
+// reconocerse como el MISMO jugador (mismo PlayerId, Role original, no el
+// de la reconexión) en vez de crear uno nuevo. Espejo de
+// TestReconnectionByIPPreservesIdentity en host_test.go. HeartbeatTimeout
+// es una constante interna de 10s (igual que en Go), así que este test
+// tarda ~10s+.
+// ---------------------------------------------------------------------
+Console.WriteLine();
+Console.WriteLine("== Test 5: reconexión por IP preserva identidad y Role original ==");
+{
+    var host = new NetworkHost();
+    var playerIds = new System.Collections.Generic.List<ushort>();
+    var reconnectedFlags = new System.Collections.Generic.List<bool>();
+    var connLock = new object();
+    host.OnPlayerConnected += (id, role, reconnected) =>
+    {
+        lock (connLock)
+        {
+            playerIds.Add(id);
+            reconnectedFlags.Add(reconnected);
+        }
+    };
+
+    var server = new Server(() => host, new ServerOptions());
+    server.StartUdp(19996);
+    Thread.Sleep(300);
+
+    var first = new NetworkClient();
+    bool firstConnected = first.CreateRoom("127.0.0.1", 19996, role: 7);
+    Check("primer cliente conecta", firstConnected);
+    ushort firstId = first.PlayerId;
+    string roomCode = first.RoomCode;
+    first.Disconnect(); // simula la caída: deja de mandar heartbeat, sin avisar
+
+    Thread.Sleep(TimeSpan.FromSeconds(10.5)); // > HeartbeatTimeout (10s)
+
+    var second = new NetworkClient();
+    // role distinto a propósito: debe ignorarse, el Role original (7) gana.
+    bool secondConnected = second.JoinRoom("127.0.0.1", 19996, role: 3, roomCode);
+    Check("segundo cliente (reconexión) conecta", secondConnected);
+    Check("reconexión preservó el PlayerId", second.PlayerId == firstId);
+
+    lock (connLock)
+    {
+        Check($"2 llamadas a OnPlayerConnected (hubo {reconnectedFlags.Count})", reconnectedFlags.Count == 2);
+        if (reconnectedFlags.Count == 2)
+        {
+            Check("la primera conexión no se marca reconnected", !reconnectedFlags[0]);
+            Check("la segunda conexión se reconoce como reconnected", reconnectedFlags[1]);
+        }
+    }
+
+    bool roleOk = host.GetClientRole(firstId, out byte roleAfter) && roleAfter == 7;
+    Check($"Role tras reconexión = el original (7), no el de la reconexión (3): got {roleAfter}", roleOk);
+
+    second.Disconnect();
+    server.Stop();
+}
+
+// ---------------------------------------------------------------------
+// Test 6: StartUdp(0) le pide al SO cualquier puerto libre; UDPPort() debe
+// devolver el que asignó de verdad (no 0) y ese puerto debe ser usable.
+// Espejo de TestUDPPortEphemeral en host_test.go.
+// ---------------------------------------------------------------------
+Console.WriteLine();
+Console.WriteLine("== Test 6: StartUdp(0) + UDPPort() (puerto efímero) ==");
+{
+    var server = new Server(() => new NetworkHost(), new ServerOptions());
+    server.StartUdp(0);
+    Check("UDPPort() no es 0 tras StartUdp(0)", server.UDPPort() != 0);
+    Thread.Sleep(200);
+
+    var client = new NetworkClient();
+    bool connected = client.CreateRoom("127.0.0.1", server.UDPPort(), role: 1);
+    Check("handshake contra el puerto efímero funciona", connected);
+    Check("playerId asignado (puerto efímero)", client.PlayerId > 0);
+
+    client.Disconnect();
+    server.Stop();
+}
+
+// ---------------------------------------------------------------------
+// Test 7: modo "host embebido" — Server.CreateRoom() arranca una sala sin
+// ningún cliente ni handshake de red, y un cliente normal se une después
+// con JoinRoom, igual que a cualquier otra sala. Espejo de
+// TestEmbeddedHostMode en client_test.go.
+// ---------------------------------------------------------------------
+Console.WriteLine();
+Console.WriteLine("== Test 7: modo host embebido (Server.CreateRoom) ==");
+{
+    var fakeState = new byte[] { 9, 9, 9 };
+    var server = new Server(() =>
+    {
+        var h = new NetworkHost();
+        h.StateProvider = () => fakeState;
+        return h;
+    }, new ServerOptions());
+    server.StartUdp(19995);
+    Thread.Sleep(200);
+
+    string roomCode = server.CreateRoom();
+    Check("CreateRoom() devolvió código de sala", roomCode.Length > 0);
+
+    var mando = new NetworkClient();
+    bool joined = mando.JoinRoom("127.0.0.1", 19995, role: 1, roomCode);
+    Check("JoinRoom contra la sala pre-creada", joined);
+    Check("playerId asignado", mando.PlayerId > 0);
+    Check("el mando terminó en la sala correcta", mando.RoomCode == roomCode);
+
+    mando.Disconnect();
+    server.Stop();
+}
+
+// ---------------------------------------------------------------------
+// Test 8: una sala pre-creada (host embebido) que todavía no admitió a
+// NADIE no debe destruirse nunca por el janitor, sin importar cuánto
+// tiempo pase — el tablero puede quedarse esperando en el lobby
+// indefinidamente. Solo empieza a correr el EmptyRoomGracePeriod una vez
+// que la sala tuvo al menos un cliente (Room.HadPlayer). Espejo de
+// TestEmbeddedHostRoomSurvivesEmptyGracePeriod en client_test.go.
+// ---------------------------------------------------------------------
+Console.WriteLine();
+Console.WriteLine("== Test 8: sala pre-creada sobrevive sin nadie más allá de EmptyRoomGracePeriod ==");
+{
+    var server = new Server(() => new NetworkHost(), new ServerOptions { EmptyRoomGracePeriod = TimeSpan.FromMilliseconds(300) });
+    server.StartUdp(19994);
+    Thread.Sleep(200);
+
+    string roomCode = server.CreateRoom();
+
+    // Esperar bastante más que el (muy corto, a propósito) grace period —
+    // si la sala vacía-sin-nadie-nunca fuera tratada igual que una vacía-
+    // tras-tener-gente, el janitor ya la habría destruido acá.
+    Thread.Sleep(1000);
+
+    var client = new NetworkClient();
+    bool joined = client.JoinRoom("127.0.0.1", 19994, role: 1, roomCode);
+    Check("la sala pre-creada sobrevivió la espera sin ser destruida", joined);
+
+    client.Disconnect();
+    server.Stop();
+}
+
 Console.WriteLine();
 if (failures == 0)
 {

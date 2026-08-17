@@ -10,10 +10,16 @@ namespace NetworkCore
     // NetworkHost nunca dependa de un socket concreto: cualquier cosa que
     // pueda mandar bytes y tenga una clave estable (Key()) sirve. Espejo de
     // la interfaz Peer en go/networkcore/host.go.
+    //
+    // IP(): el protocolo no lleva ningún token de sesión, así que
+    // AdmitPlayer usa la IP (sin el puerto, que cambia en cada reconexión —
+    // nuevo socket UDP) como heurística para reconocer "es el mismo
+    // dispositivo reconectándose" — ver el comentario grande ahí.
     public interface IPeer
     {
         void Send(byte[] data);
         string Key();
+        string IP();
     }
 
     // Rol "servidor" del protocolo. Es una clase C# plana (sin MonoBehaviour,
@@ -86,8 +92,11 @@ namespace NetworkCore
         // Se dispara cuando un jugador nuevo termina el handshake (ver
         // AdmitPlayer). Role es opaco para el core — cada juego define sus
         // propios valores y qué hacer con ellos (ej. no crear una "barra" de
-        // juego para el rol que representa al tablero).
-        public event Action<ushort, byte>? OnPlayerConnected;
+        // juego para el rol que representa al tablero). reconnected=true si
+        // esto fue una reconexión reconocida por IP (ver AdmitPlayer) — el
+        // juego puede usarlo para NO pisar el estado que ya tenía ese
+        // jugador con uno vacío.
+        public event Action<ushort, byte, bool>? OnPlayerConnected;
         // Se dispara cuando un jugador se desconecta (timeout de heartbeat).
         public event Action<ushort>? OnPlayerDisconnected;
         // Se dispara para cada input recibido, en orden, dentro del tick loop.
@@ -191,9 +200,22 @@ namespace NetworkCore
             lock (client.QueueLock) return client.ReliableQueue.Count;
         }
 
+        // Solo cuenta Connected==true — _clientsById también incluye
+        // clientes desconectados que quedaron "reclamables" para una
+        // reconexión (ver HeartbeatLoop/AdmitPlayer), así que Count ya no
+        // alcanza.
         public int ConnectedPlayerCount
         {
-            get { lock (_clientsLock) return _clientsById.Count; }
+            get
+            {
+                lock (_clientsLock)
+                {
+                    int n = 0;
+                    foreach (var c in _clientsById.Values)
+                        if (c.Connected) n++;
+                    return n;
+                }
+            }
         }
 
         // --- Recepción: punto de entrada común para cualquier transporte ---
@@ -222,38 +244,83 @@ namespace NetworkCore
             }
         }
 
-        // AdmitPlayer registra un cliente nuevo en esta sala y dispara
-        // OnPlayerConnected(playerId, role). La llama Server, después de
-        // decidir (crear/unirse) a qué sala pertenece el cliente. Role es
-        // opaco para el core — cada juego define sus propios valores y qué
-        // hacer con ellos (ej. no crear una "barra" de juego para el rol que
-        // representa al tablero). Idempotente: un cliente que ya está
-        // admitido devuelve su PlayerId actual sin duplicar estado (cubre el
-        // reintento de un handshake cuyo ack se perdió).
-        public ushort AdmitPlayer(IPeer peer, byte role)
+        // AdmitPlayer registra un cliente nuevo en esta sala, o reconoce una
+        // reconexión, y dispara OnPlayerConnected(playerId, role,
+        // reconnected). La llama Server, después de decidir (crear/unirse)
+        // a qué sala pertenece el cliente. Role es opaco para el core — cada
+        // juego define sus propios valores y qué hacer con ellos (ej. no
+        // crear una "barra" de juego para el rol que representa al
+        // tablero).
+        //
+        // Reconexión: si hay un cliente marcado desconectado (ver
+        // HeartbeatLoop) con la misma IP (Peer.IP()) que quien está haciendo
+        // el handshake, se le devuelve la MISMA identidad (PlayerId, y el
+        // Role ORIGINAL — no el que venga en este handshake, para no perder
+        // de vista quién era) en vez de crear un jugador nuevo. Es una
+        // heurística por IP, no un token de sesión (el protocolo no lleva
+        // uno todavía): funciona bien en la LAN/datos móviles típica, donde
+        // cada dispositivo tiene su propia IP — no es a prueba de balas si
+        // dos jugadores comparten la misma IP pública (NAT compartido) y
+        // ambos están desconectados a la vez.
+        //
+        // Idempotente además en el sentido de siempre: un cliente que ya
+        // está admitido (mismo Peer.Key(), sin pasar por desconexión)
+        // devuelve su PlayerId actual sin duplicar estado ni disparar el
+        // hook de nuevo (cubre el reintento de un handshake cuyo ack se
+        // perdió).
+        public ushort AdmitPlayer(IPeer peer, byte role, out bool reconnected)
         {
             string key = peer.Key();
             ushort playerId;
+            reconnected = false;
 
             lock (_clientsLock)
             {
                 if (_clientsByKey.TryGetValue(key, out var existing))
                     return existing.PlayerId;
 
-                playerId = _nextPlayerId++;
-                var client = new ClientConnection
+                ClientConnection? reclaimed = null;
+                string ip = peer.IP();
+                if (!string.IsNullOrEmpty(ip))
                 {
-                    PlayerId = playerId,
-                    Peer = peer,
-                    Role = role,
-                    LastHeartbeat = DateTime.UtcNow,
-                    Connected = true
-                };
-                _clientsById[playerId] = client;
-                _clientsByKey[key] = client;
+                    foreach (var c in _clientsById.Values)
+                    {
+                        if (!c.Connected && c.Peer.IP() == ip)
+                        {
+                            reclaimed = c;
+                            break;
+                        }
+                    }
+                }
+
+                if (reclaimed != null)
+                {
+                    _clientsByKey.Remove(reclaimed.Peer.Key());
+                    reclaimed.Peer = peer;
+                    reclaimed.Connected = true;
+                    reclaimed.LastHeartbeat = DateTime.UtcNow;
+                    _clientsByKey[key] = reclaimed;
+                    playerId = reclaimed.PlayerId;
+                    role = reclaimed.Role;
+                    reconnected = true;
+                }
+                else
+                {
+                    playerId = _nextPlayerId++;
+                    var client = new ClientConnection
+                    {
+                        PlayerId = playerId,
+                        Peer = peer,
+                        Role = role,
+                        LastHeartbeat = DateTime.UtcNow,
+                        Connected = true
+                    };
+                    _clientsById[playerId] = client;
+                    _clientsByKey[key] = client;
+                }
             }
 
-            OnPlayerConnected?.Invoke(playerId, role);
+            OnPlayerConnected?.Invoke(playerId, role, reconnected);
             return playerId;
         }
 
@@ -457,11 +524,19 @@ namespace NetworkCore
                             toRemove.Add(kv.Key);
                     }
 
+                    // Solo se marca Connected=false — a propósito NO se
+                    // borra de _clientsById: se mantiene "reclamable" por
+                    // AdmitPlayer si el mismo dispositivo (misma IP) vuelve
+                    // a conectarse, así el juego puede restaurar su estado
+                    // en vez de tratarlo como uno nuevo. _clientsByKey sí se
+                    // limpia: esa key (ej. ip:puerto UDP viejo) ya no sirve
+                    // para rutear nada. El Server, por su lado, no destruye
+                    // esta sala instantáneamente al quedar en 0 conectados —
+                    // ver ServerOptions.EmptyRoomGracePeriod.
                     foreach (var id in toRemove)
                     {
                         var client = _clientsById[id];
                         client.Connected = false;
-                        _clientsById.Remove(id);
                         _clientsByKey.Remove(client.Peer.Key());
                     }
                 }

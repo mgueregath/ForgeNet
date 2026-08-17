@@ -33,6 +33,13 @@ namespace NetworkCore
         // flood simple desde una única conexión.
         public int HandshakeRateLimit = 10;
         public TimeSpan HandshakeRateLimitWindow = TimeSpan.FromSeconds(10);
+
+        // Cuánto se espera, desde que una sala que ya tuvo jugadores queda
+        // en 0 conectados, antes de destruirla — no instantáneo, para
+        // darle tiempo a AdmitPlayer de reconocer una reconexión (ver el
+        // comentario grande ahí) antes de que la sala misma deje de
+        // existir. Default: 30s.
+        public TimeSpan EmptyRoomGracePeriod = TimeSpan.FromSeconds(30);
     }
 
     internal class Room
@@ -40,6 +47,9 @@ namespace NetworkCore
         public string Code = "";
         public NetworkHost Host = null!;
         public bool HadPlayer;
+        // Desde cuándo Host.ConnectedPlayerCount está en 0 — null mientras
+        // la sala tiene al menos un cliente conectado. Ver SweepEmptyRooms.
+        public DateTime? EmptySince;
     }
 
     // PeerInfo recuerda a qué sala pertenece cada Peer y guarda el último
@@ -79,6 +89,8 @@ namespace NetworkCore
         }
 
         public string Key() => "udp:" + _endPoint;
+
+        public string IP() => _endPoint.Address.ToString();
     }
 
     // Server multiplexa muchas salas (partidas) concurrentes sobre el mismo
@@ -106,6 +118,7 @@ namespace NetworkCore
 
         private UdpClient? _udp;
         private volatile bool _running;
+        private ushort _udpPort;
 
         public Server(RoomFactory roomFactory, ServerOptions? options = null)
         {
@@ -114,12 +127,19 @@ namespace NetworkCore
             if (_opts.RoomCodeLength <= 0) _opts.RoomCodeLength = 6;
             if (_opts.HandshakeRateLimit <= 0) _opts.HandshakeRateLimit = 10;
             if (_opts.HandshakeRateLimitWindow <= TimeSpan.Zero) _opts.HandshakeRateLimitWindow = TimeSpan.FromSeconds(10);
+            if (_opts.EmptyRoomGracePeriod <= TimeSpan.Zero) _opts.EmptyRoomGracePeriod = TimeSpan.FromSeconds(30);
         }
 
         // StartUdp liga un socket UDP y arranca su loop de recepción, más el
         // janitor que destruye salas vacías. No arranca ninguna sala
         // todavía — las salas se crean bajo demanda con el primer handshake
-        // HandshakeMode.Create.
+        // HandshakeMode.Create (o directamente con CreateRoom(), para el
+        // modo "host embebido").
+        //
+        // port=0 le pide al SO cualquier puerto disponible — útil para un
+        // deployment que no quiere depender de que un puerto fijo esté
+        // libre. El puerto real que asignó el SO queda disponible en
+        // UDPPort().
         public void StartUdp(int port)
         {
             _udp = new UdpClient(port);
@@ -131,11 +151,18 @@ namespace NetworkCore
             // _running en vez de depender de que Close() interrumpa un
             // Receive() bloqueado en otro thread.
             _udp.Client.ReceiveTimeout = 500;
+            _udpPort = (ushort)((IPEndPoint)_udp.Client.LocalEndPoint!).Port;
             _running = true;
 
             new Thread(UdpReceiveLoop) { IsBackground = true, Name = "Server.UdpReceive" }.Start();
             new Thread(JanitorLoop) { IsBackground = true, Name = "Server.Janitor" }.Start();
         }
+
+        // UDPPort devuelve el puerto UDP real en el que quedó escuchando el
+        // server — el mismo que se pidió en StartUdp, salvo que se haya
+        // pedido 0 (cualquiera disponible), en cuyo caso es el que el SO
+        // asignó de verdad. 0 si StartUdp nunca se llamó.
+        public ushort UDPPort() => _udpPort;
 
         // Stop cierra el transporte y detiene todas las salas.
         public void Stop()
@@ -232,7 +259,7 @@ namespace NetworkCore
             switch (mode)
             {
                 case HandshakeMode.Create:
-                    room = CreateRoom();
+                    room = CreateRoomInternal();
                     break;
 
                 case HandshakeMode.Join:
@@ -254,7 +281,7 @@ namespace NetworkCore
                 return;
             }
 
-            ushort playerId = room.Host.AdmitPlayer(peer, role);
+            ushort playerId = room.Host.AdmitPlayer(peer, role, out _);
             room.HadPlayer = true;
 
             var ack = Concat(PacketHeader.Build(seq, 0, PacketType.Handshake), HandshakeAck.Encode(playerId, room.Code));
@@ -262,6 +289,22 @@ namespace NetworkCore
 
             lock (_lock) _peers[key] = new PeerInfo { RoomCode = room.Code, Ack = ack };
         }
+
+        // CreateRoom arranca una sala directamente, sin pasar por un
+        // handshake de red — a diferencia de una sala creada porque un
+        // cliente mandó HandshakeMode.Create, acá no hay ningún cliente
+        // admitido todavía.
+        //
+        // Pensado para el modo "host embebido" (ej. un tablero en LAN, que
+        // es el mismo proceso que corre el Server): la app llama a esto una
+        // vez al arrancar y ya tiene una sala fija a la que los mandos se
+        // unen con JoinRoom, sin que el propio tablero tenga que hacerse
+        // pasar por cliente de sí mismo para "crear" la sala. La sala recién
+        // creada NO cuenta como "vacía" para el janitor (ver
+        // SweepEmptyRooms/Room.HadPlayer) hasta que admite a su primer
+        // cliente de verdad, así que puede esperar indefinidamente a que
+        // alguien se una sin que EmptyRoomGracePeriod la destruya.
+        public string CreateRoom() => CreateRoomInternal().Code;
 
         // AllowHandshakeAttempt aplica el rate limit de
         // ServerOptions.HandshakeRateLimit por Peer — ventana fija, no token
@@ -282,7 +325,7 @@ namespace NetworkCore
             }
         }
 
-        private Room CreateRoom()
+        private Room CreateRoomInternal()
         {
             string code = GenerateUniqueRoomCode();
             var host = _roomFactory();
@@ -316,9 +359,9 @@ namespace NetworkCore
         }
 
         // JanitorLoop destruye salas que se quedaron sin ningún cliente
-        // conectado — genérico, no sabe qué juego corre en ellas. Una sala
-        // recién creada que todavía no tuvo ningún cliente no se toca
-        // (Room.HadPlayer).
+        // conectado durante más de EmptyRoomGracePeriod — genérico, no sabe
+        // qué juego corre en ellas. Una sala recién creada que todavía no
+        // tuvo ningún cliente no se toca (Room.HadPlayer).
         private void JanitorLoop()
         {
             while (_running)
@@ -335,11 +378,27 @@ namespace NetworkCore
         {
             lock (_lock)
             {
+                var now = DateTime.UtcNow;
                 var toRemove = new List<string>();
                 foreach (var kv in _rooms)
                 {
                     var room = kv.Value;
-                    if (!room.HadPlayer || room.Host.ConnectedPlayerCount > 0) continue;
+                    if (!room.HadPlayer) continue;
+
+                    if (room.Host.ConnectedPlayerCount > 0)
+                    {
+                        room.EmptySince = null;
+                        continue;
+                    }
+
+                    if (room.EmptySince == null)
+                    {
+                        room.EmptySince = now;
+                        continue;
+                    }
+
+                    if (now - room.EmptySince.Value < _opts.EmptyRoomGracePeriod) continue;
+
                     room.Host.Stop();
                     toRemove.Add(kv.Key);
                 }
