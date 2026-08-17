@@ -5,11 +5,15 @@
 
 mod host;
 mod protocol;
+mod server;
 mod types;
 
 pub use host::{EventQueue, NetworkHost, NetworkHostHandle};
 pub use protocol::{
-    build_header, parse_header, FLAG_ORDERED, FLAG_RELIABLE, HEADER_SIZE, PACKET_ACK,
-    PACKET_HANDSHAKE, PACKET_INPUT, PACKET_PING, PACKET_SNAPSHOT,
+    build_header, decode_join_payload, encode_handshake_ack, encode_join_payload, parse_header,
+    FLAG_ORDERED, FLAG_RELIABLE, HANDSHAKE_MODE_CREATE, HANDSHAKE_MODE_JOIN, HEADER_SIZE,
+    PACKET_ACK, PACKET_DISCONNECT, PACKET_HANDSHAKE, PACKET_INPUT, PACKET_PING, PACKET_SNAPSHOT,
+    REASON_ROOM_FULL, REASON_ROOM_NOT_FOUND,
 };
+pub use server::{RoomFactory, Server, ServerOptions};
 pub use types::{decode_input_payload, encode_input_payload, GameEvent, GameSnapshot, PlayerInput};

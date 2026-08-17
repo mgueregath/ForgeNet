@@ -1,6 +1,9 @@
-//! Rol "servidor" del protocolo. No sabe nada del juego que corre encima —
-//! se engancha vía los campos de callback de `NetworkHost`, igual que
-//! `NetworkHost` en los cores de Go y C#.
+//! Rol "servidor" del protocolo para UNA sala/partida. No sabe nada del
+//! juego que corre encima — se engancha vía los campos de callback de
+//! `NetworkHost`, igual que `NetworkHost` en los cores de Go y C#. Tampoco
+//! sabe de qué transporte vienen los paquetes ni a qué sala pertenece: eso
+//! lo decide `Server`, que crea una instancia de `NetworkHost` por sala,
+//! le da el socket compartido y le rutea sus paquetes (ver server.rs).
 
 use crate::protocol::*;
 use crate::types::*;
@@ -32,9 +35,14 @@ struct ReliableMessage {
     retries: u8,
 }
 
+/// Estado de sesión de un cliente. No tiene ningún campo de estado de juego
+/// — eso vive en el juego, no acá. `role` es opaco: el core lo guarda y lo
+/// expone (ver `NetworkHostHandle::get_client_role`) pero nunca lo
+/// interpreta — cada juego define sus propios valores y qué significan.
 struct ClientConnection {
     player_id: u16,
     addr: SocketAddr,
+    role: u8,
     last_heartbeat: Instant,
     #[allow(dead_code)]
     ping: i32,
@@ -43,6 +51,8 @@ struct ClientConnection {
 }
 
 type ConnHook = Box<dyn Fn(u16) + Send + Sync + 'static>;
+/// El core no interpreta `role`: solo lo pasa tal cual llegó del handshake.
+type RoleConnHook = Box<dyn Fn(u16, u8) + Send + Sync + 'static>;
 type InputHook = Box<dyn Fn(PlayerInput) + Send + Sync + 'static>;
 type TickHook = Box<dyn Fn(u64) + Send + Sync + 'static>;
 type StateHook = Box<dyn Fn() -> Vec<u8> + Send + Sync + 'static>;
@@ -70,7 +80,7 @@ impl EventQueue {
 }
 
 struct Inner {
-    socket: UdpSocket,
+    socket: Arc<UdpSocket>,
     clients: DashMap<u16, ClientConnection>,
     clients_by_addr: DashMap<SocketAddr, u16>,
     next_player_id: AtomicU32,
@@ -80,20 +90,22 @@ struct Inner {
     input_tx: mpsc::UnboundedSender<PlayerInput>,
     running: AtomicBool,
 
-    on_player_connected: Option<ConnHook>,
+    on_player_connected: Option<RoleConnHook>,
     on_player_disconnected: Option<ConnHook>,
     on_input: Option<InputHook>,
     on_tick: Option<TickHook>,
     state_provider: Option<StateHook>,
 }
 
-/// Rol "servidor". Se configuran los hooks (`on_input`, etc.) y después se
-/// llama a `start()`, que consume el host y devuelve un `NetworkHostHandle`
-/// para poder llamar `stop`/`connected_player_count` mientras los loops
-/// corren en background. Para encolar eventos desde un hook, usar
+/// Rol "servidor" del protocolo para UNA sala/partida. Se configuran los
+/// hooks (`on_input`, etc.) y después se llama a `start(socket)` — el socket
+/// lo posee y comparte `Server`, que es quien decide a qué sala pertenece
+/// cada paquete (ver server.rs) — que consume el host y devuelve un
+/// `NetworkHostHandle` para poder llamar `stop`/`admit_player`/etc. mientras
+/// los loops corren en background. Para encolar eventos desde un hook, usar
 /// `events()` (ver `EventQueue`).
 pub struct NetworkHost {
-    pub on_player_connected: Option<ConnHook>,
+    pub on_player_connected: Option<RoleConnHook>,
     pub on_player_disconnected: Option<ConnHook>,
     pub on_input: Option<InputHook>,
     pub on_tick: Option<TickHook>,
@@ -114,6 +126,7 @@ impl Default for NetworkHost {
     }
 }
 
+#[derive(Clone)]
 pub struct NetworkHostHandle {
     inner: Arc<Inner>,
 }
@@ -130,8 +143,12 @@ impl NetworkHost {
         self.events.clone()
     }
 
-    pub async fn start(self, port: u16) -> std::io::Result<NetworkHostHandle> {
-        let socket = UdpSocket::bind(("0.0.0.0", port)).await?;
+    /// Arranca los loops de fondo de esta sala (tick, retransmisión,
+    /// heartbeat) usando el socket compartido que le pasa `Server`. No liga
+    /// ningún socket propio ni recibe paquetes directamente — eso es
+    /// responsabilidad de `Server` (ver `Server::handle_packet`, que rutea
+    /// los paquetes de esta sala a `NetworkHostHandle::handle_packet`).
+    pub fn start(self, socket: Arc<UdpSocket>) -> NetworkHostHandle {
         let (input_tx, input_rx) = mpsc::unbounded_channel();
 
         let inner = Arc::new(Inner {
@@ -151,14 +168,11 @@ impl NetworkHost {
             state_provider: self.state_provider,
         });
 
-        println!("🎮 NetworkHost escuchando en :{} (60Hz)", port);
-
-        tokio::spawn(receive_loop(inner.clone()));
         tokio::spawn(game_loop(inner.clone(), input_rx));
         tokio::spawn(send_loop(inner.clone()));
         tokio::spawn(heartbeat_loop(inner.clone()));
 
-        Ok(NetworkHostHandle { inner })
+        NetworkHostHandle { inner }
     }
 }
 
@@ -177,59 +191,129 @@ impl NetworkHostHandle {
     pub fn connected_player_count(&self) -> usize {
         self.inner.clients.len()
     }
-}
 
-async fn receive_loop(inner: Arc<Inner>) {
-    let mut buf = vec![0u8; 2048];
-    while inner.running.load(Ordering::SeqCst) {
-        let (n, addr) = match inner.socket.recv_from(&mut buf).await {
-            Ok(v) => v,
-            Err(_) => continue,
+    /// Registra un cliente nuevo en esta sala y dispara
+    /// `on_player_connected(player_id, role)`. La llama `Server`, después de
+    /// decidir (crear/unirse) a qué sala pertenece el cliente. `role` es
+    /// opaco para el core — cada juego define sus propios valores y qué
+    /// hacer con ellos (ej. no crear una "barra" de juego para el rol que
+    /// representa al tablero). Idempotente: un cliente que ya está admitido
+    /// devuelve su player_id actual sin duplicar estado (cubre el reintento
+    /// de un handshake cuyo ack se perdió).
+    pub fn admit_player(&self, addr: SocketAddr, role: u8) -> u16 {
+        if let Some(existing) = self.inner.clients_by_addr.get(&addr) {
+            return *existing;
+        }
+
+        let player_id = self.inner.next_player_id.fetch_add(1, Ordering::Relaxed) as u16;
+        self.inner.clients_by_addr.insert(addr, player_id);
+        self.inner.clients.insert(
+            player_id,
+            ClientConnection {
+                player_id,
+                addr,
+                role,
+                last_heartbeat: Instant::now(),
+                ping: 0,
+                connected: true,
+                reliable_queue: Vec::new(),
+            },
+        );
+
+        if let Some(cb) = &self.inner.on_player_connected {
+            cb(player_id, role);
+        }
+        player_id
+    }
+
+    /// Rol opaco con el que se admitió a un jugador (ver `admit_player`).
+    /// `None` si el jugador no existe (ya desconectado, o id inválido).
+    pub fn get_client_role(&self, player_id: u16) -> Option<u8> {
+        self.inner.clients.get(&player_id).map(|c| c.role)
+    }
+
+    /// Procesa un paquete crudo recibido de un cliente que YA pertenece a
+    /// esta sala. El handshake no pasa por acá: es `Server` quien lo
+    /// intercepta primero para decidir a qué sala corresponde y recién ahí
+    /// llama a `admit_player` (ver server.rs).
+    pub async fn handle_packet(&self, data: &[u8], addr: SocketAddr) {
+        dispatch_packet(&self.inner, data, addr).await;
+    }
+
+    /// Hace lo mismo que `events().push(evt)` (el evento sale en el próximo
+    /// snapshot de todos modos) pero además lo manda ya mismo, a cada
+    /// cliente conectado, como un paquete aparte marcado `FLAG_RELIABLE` —
+    /// el core lo reintenta (mismo mecanismo que ya existía para reliable
+    /// input, ver `send_loop`) hasta que el cliente lo confirma con
+    /// `PACKET_ACK` o se agotan los reintentos. Pensado para eventos que el
+    /// juego no puede permitirse perder en una red con pérdida real (ej.
+    /// GOAL en un server público).
+    ///
+    /// La entrega es "al menos una vez", no "exactamente una vez": el
+    /// cliente puede recibir el mismo evento acá y de nuevo en el snapshot
+    /// normal — el juego debe tratarlo como una notificación idempotente
+    /// (ej. "hubo un gol, resincronizá con state_payload"), no como algo que
+    /// suma un contador él mismo.
+    pub fn queue_reliable_event(&self, evt: GameEvent) {
+        self.inner.pending_events.push(evt.clone());
+
+        let tick = self.inner.tick.load(Ordering::SeqCst);
+        let snap = GameSnapshot {
+            tick,
+            timestamp: now_unix_millis(),
+            state_payload: Vec::new(),
+            events: vec![evt],
         };
-        handle_packet(&inner, &buf[..n], addr).await;
+        let payload = snap.encode();
+
+        let addrs: Vec<(u16, SocketAddr)> =
+            self.inner.clients.iter().map(|c| (c.player_id, c.addr)).collect();
+
+        for (player_id, addr) in addrs {
+            let seq = self.inner.sequence_counter.fetch_add(1, Ordering::Relaxed);
+            let mut packet = build_header(seq, 0, PACKET_SNAPSHOT, FLAG_RELIABLE);
+            packet.extend_from_slice(&payload);
+
+            if let Some(mut client) = self.inner.clients.get_mut(&player_id) {
+                client.reliable_queue.push(ReliableMessage {
+                    seq,
+                    data: packet.clone(),
+                    sent: Instant::now(),
+                    retries: 0,
+                });
+            }
+
+            let socket = self.inner.socket.clone();
+            tokio::spawn(async move {
+                let _ = socket.send_to(&packet, addr).await;
+            });
+        }
+    }
+
+    /// Cuántos paquetes reliable (ver `queue_reliable_event`) todavía no
+    /// fueron confirmados por este cliente. Diagnóstico genérico — útil para
+    /// cualquier juego que quiera saber si un cliente se está quedando
+    /// atrás, no es específico de ningún evento en particular.
+    pub fn pending_reliable_count(&self, player_id: u16) -> usize {
+        self.inner
+            .clients
+            .get(&player_id)
+            .map(|c| c.reliable_queue.len())
+            .unwrap_or(0)
     }
 }
 
-async fn handle_packet(inner: &Arc<Inner>, data: &[u8], addr: SocketAddr) {
+async fn dispatch_packet(inner: &Arc<Inner>, data: &[u8], addr: SocketAddr) {
     let Some((seq, _ack, packet_type, flags)) = parse_header(data) else {
         return;
     };
     let payload = &data[HEADER_SIZE..];
 
     match packet_type {
-        PACKET_HANDSHAKE => handle_handshake(inner, seq, addr).await,
         PACKET_INPUT => handle_input(inner, seq, addr, flags, payload).await,
         PACKET_ACK => handle_ack(inner, seq, addr).await,
         PACKET_PING => handle_ping(inner, seq, addr, payload).await,
         _ => {}
-    }
-}
-
-async fn handle_handshake(inner: &Arc<Inner>, seq: u32, addr: SocketAddr) {
-    if inner.clients_by_addr.contains_key(&addr) {
-        return;
-    }
-
-    let player_id = inner.next_player_id.fetch_add(1, Ordering::Relaxed) as u16;
-    inner.clients_by_addr.insert(addr, player_id);
-    inner.clients.insert(
-        player_id,
-        ClientConnection {
-            player_id,
-            addr,
-            last_heartbeat: Instant::now(),
-            ping: 0,
-            connected: true,
-            reliable_queue: Vec::new(),
-        },
-    );
-
-    let mut response = build_header(seq, 0, PACKET_HANDSHAKE, 0);
-    response.extend_from_slice(&player_id.to_be_bytes());
-    let _ = inner.socket.send_to(&response, addr).await;
-
-    if let Some(cb) = &inner.on_player_connected {
-        cb(player_id);
     }
 }
 
