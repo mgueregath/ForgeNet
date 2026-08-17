@@ -2,6 +2,13 @@
 // StatePayload de taca-taca (Ball/Rod/Score) sin que networkcore.ts sepa
 // nada de esto. Análogo (solo lectura, porque TS acá es cliente) a
 // TacaTacaState en los ejemplos de Go/Rust/Python/C#.
+
+// Roles de taca-taca — opacos para el core (viajan como el byte Role del
+// handshake, ver networkcore.ts), definidos y usados solo acá. Deben
+// coincidir con roleBoard/rolePaddle en go/ejemplo-tacataca/main.go.
+export const ROLE_BOARD = 0x01;
+export const ROLE_PADDLE = 0x02;
+
 export interface RodState {
   playerId: number;
   position: number;

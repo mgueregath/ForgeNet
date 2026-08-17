@@ -55,8 +55,11 @@ web/
    - `:8080` HTTP — sirve `web/index.html` + `/certhash`
 
 3. Abrir `http://localhost:8080/` en el navegador. La página obtiene el
-   hash del certificado solo (`fetch('/certhash')`), conecta, y muestra el
-   estado en pantalla.
+   hash del certificado solo (`fetch('/certhash')`), conecta, crea una sala
+   nueva (`createRoom`) y muestra el `playerId` y el `roomCode` asignado en
+   pantalla. Para unirse a una sala ya creada por otra pestaña/dispositivo
+   en vez de crear una nueva, abrir `http://localhost:8080/?room=CODIGO`
+   (usa `joinRoom` con ese código).
 
 Validado con Chrome real (vía Playwright, no solo compilación): handshake,
 envío de input, decodificación del esquema taca-taca completo, y

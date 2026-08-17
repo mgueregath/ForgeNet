@@ -8,8 +8,8 @@
 // Este script NO levanta el servidor Go (spawnear subprocesos desde Node
 // no es confiable en todos los entornos) — asume que ya está corriendo en
 // 127.0.0.1:9999. Ver README para el comando exacto.
-import { NetworkClient } from "./networkcore";
-import { decodeTacaTacaState } from "./ejemplo-tacataca";
+import { NetworkClient, HandshakeRejectedError } from "./networkcore";
+import { decodeTacaTacaState, ROLE_PADDLE } from "./ejemplo-tacataca";
 
 let failures = 0;
 
@@ -31,13 +31,28 @@ async function main() {
   console.log("   (requiere que el servidor Go ya esté corriendo en :9999)");
 
   const client = new NetworkClient();
-  const connected = await client.connect("127.0.0.1", 9999);
+  let connected = true;
+  try {
+    // rolePaddle: este cliente se registra como mando, así el server crea
+    // una barra para él (necesario para que el resto del test — posición,
+    // rotación, gol — tenga algo que verificar). Crea una sala nueva
+    // (HANDSHAKE_MODE_CREATE) porque este test no depende de ninguna sala
+    // preexistente.
+    await client.createRoom("127.0.0.1", 9999, ROLE_PADDLE);
+  } catch (e) {
+    connected = false;
+    if (e instanceof HandshakeRejectedError) {
+      console.log(`\nHandshake rechazado por el server, reason=${e.reason}`);
+    } else {
+      console.log(`\nNo se pudo conectar — ¿está corriendo el servidor Go en :9999? (${e})`);
+    }
+  }
   check("handshake contra ejemplo taca-taca (Go)", connected);
   if (!connected) {
-    console.log("\nNo se pudo conectar — ¿está corriendo el servidor Go en :9999?");
     process.exit(1);
   }
   check("playerId asignado", client.playerId > 0);
+  check("roomCode asignado", client.roomCode.length > 0);
 
   client.sendInput(25, 0, 30, 0);
   client.sendInput(0, 0, 30, 0x01, true); // "meter un gol"

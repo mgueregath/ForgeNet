@@ -16,11 +16,60 @@ export const PACKET_INPUT = 0x02;
 export const PACKET_ACK = 0x03;
 export const PACKET_PING = 0x04;
 export const PACKET_HANDSHAKE = 0x05;
+export const PACKET_DISCONNECT = 0x06;
 
 export const FLAG_RELIABLE = 0x02;
 export const FLAG_ORDERED = 0x04;
 
 export const HEADER_SIZE = 9;
+
+// --- Handshake (join) ---
+//
+// El core no sabe qué juego corre encima, así que Role viaja como un byte
+// opaco: cada juego define sus propios valores y su propio significado (ver
+// ejemplo-tacataca.ts), igual que ya pasa con StatePayload y GameEvent.eventType.
+
+// Modos de handshake — quién crea una sala nueva vs. quién se une a una
+// existente por código. Esto sí es genérico: cualquier juego con sesiones
+// de partida necesita esta distinción.
+export const HANDSHAKE_MODE_CREATE = 0x00;
+export const HANDSHAKE_MODE_JOIN = 0x01;
+
+// Motivos de rechazo del handshake, recibidos en un PACKET_DISCONNECT.
+export const REASON_ROOM_NOT_FOUND = 0x01;
+export const REASON_ROOM_FULL = 0x02;
+
+// Lanzada por createRoom/joinRoom cuando el server rechaza el handshake
+// (ej. código de sala inexistente, o sala llena) en vez de admitir.
+export class HandshakeRejectedError extends Error {
+  constructor(public readonly reason: number) {
+    super(`handshake rechazado por el server (reason=${reason})`);
+  }
+}
+
+// encodeJoinPayload: Mode(1) + Role(1) + RoomCodeLen(1) + RoomCode(N). Va
+// después del header en un PACKET_HANDSHAKE enviado por el cliente.
+// RoomCode se ignora en HANDSHAKE_MODE_CREATE (el server genera el código).
+export function encodeJoinPayload(mode: number, role: number, roomCode: string): Buffer {
+  const codeBuf = Buffer.from(roomCode, "ascii");
+  const buf = Buffer.alloc(3 + codeBuf.length);
+  buf[0] = mode;
+  buf[1] = role;
+  buf[2] = codeBuf.length;
+  codeBuf.copy(buf, 3);
+  return buf;
+}
+
+// decodeHandshakeAck: PlayerID(2) + RoomCodeLen(1) + RoomCode(N) — respuesta
+// del server tanto a un Create como a un Join.
+export function decodeHandshakeAck(payload: Buffer): { playerId: number; roomCode: string } | null {
+  if (payload.length < 3) return null;
+  const playerId = payload.readUInt16BE(0);
+  const codeLen = payload[2];
+  if (payload.length < 3 + codeLen) return null;
+  const roomCode = payload.subarray(3, 3 + codeLen).toString("ascii");
+  return { playerId, roomCode };
+}
 
 export function buildHeader(seq: number, ack: number, type: number, flags = 0): Buffer {
   const buf = Buffer.alloc(HEADER_SIZE);
@@ -137,6 +186,7 @@ export class NetworkClient {
   private running = false;
 
   playerId = 0;
+  roomCode = "";
   connected = false;
   lastPingMs = 0;
   latestSnapshot: GameSnapshot | null = null;
@@ -149,30 +199,66 @@ export class NetworkClient {
     this.socket.on("message", (msg) => this.handlePacket(msg));
   }
 
-  connect(host: string, port: number, timeoutMs = 3000): Promise<boolean> {
+  // createRoom hace un handshake HANDSHAKE_MODE_CREATE: arranca una sala
+  // nueva en el server y recibe su código (ej. para mostrarlo/QR-earlo y
+  // que otros clientes se unan con joinRoom). role es opaco para el core —
+  // ver ejemplo-tacataca.ts para su significado en este juego.
+  createRoom(host: string, port: number, role: number, timeoutMs = 3000): Promise<{ playerId: number; roomCode: string }> {
+    return this.handshake(host, port, HANDSHAKE_MODE_CREATE, role, "", timeoutMs);
+  }
+
+  // joinRoom se une a una sala existente por código (HANDSHAKE_MODE_JOIN).
+  // Rechaza con HandshakeRejectedError si el código no existe o la sala
+  // está llena (ver REASON_ROOM_NOT_FOUND / REASON_ROOM_FULL).
+  joinRoom(host: string, port: number, role: number, roomCode: string, timeoutMs = 3000): Promise<{ playerId: number; roomCode: string }> {
+    return this.handshake(host, port, HANDSHAKE_MODE_JOIN, role, roomCode, timeoutMs);
+  }
+
+  private handshake(
+    host: string,
+    port: number,
+    mode: number,
+    role: number,
+    roomCode: string,
+    timeoutMs: number,
+  ): Promise<{ playerId: number; roomCode: string }> {
     this.serverAddr = { host, port };
 
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
       const onMessage = (msg: Buffer) => {
         const header = parseHeader(msg);
-        if (!header || header.type !== PACKET_HANDSHAKE || msg.length < 11) return;
+        if (!header) return;
 
-        this.playerId = msg.readUInt16BE(9);
+        if (header.type === PACKET_DISCONNECT) {
+          const reason = msg.length > HEADER_SIZE ? msg[HEADER_SIZE] : 0;
+          this.socket.removeListener("message", onMessage);
+          clearTimeout(timer);
+          reject(new HandshakeRejectedError(reason));
+          return;
+        }
+
+        if (header.type !== PACKET_HANDSHAKE) return;
+        const ack = decodeHandshakeAck(msg.subarray(HEADER_SIZE));
+        if (!ack) return;
+
+        this.playerId = ack.playerId;
+        this.roomCode = ack.roomCode;
         this.connected = true;
         this.running = true;
         this.socket.removeListener("message", onMessage);
         clearTimeout(timer);
-        resolve(true);
+        resolve(ack);
       };
 
       const timer = setTimeout(() => {
         this.socket.removeListener("message", onMessage);
-        resolve(false);
+        reject(new Error("handshake: timeout esperando respuesta del server"));
       }, timeoutMs);
 
       this.socket.on("message", onMessage);
 
-      const handshake = buildHeader(0, 0, PACKET_HANDSHAKE);
+      const payload = encodeJoinPayload(mode, role, roomCode);
+      const handshake = Buffer.concat([buildHeader(0, 0, PACKET_HANDSHAKE), payload]);
       this.socket.send(handshake, port, host);
     });
   }
@@ -222,6 +308,14 @@ export class NetworkClient {
           this.latestSnapshot = snapshot;
           this.onSnapshot?.(snapshot);
         }
+        // Un snapshot FLAG_RELIABLE es un evento puntual que el server
+        // reintenta hasta confirmarse (ver NetworkHost.QueueReliableEvent
+        // en Go) — hay que ackearlo, si no el server lo reenvía sin parar.
+        // Convención de este protocolo: el ack lleva seq=ack=el seq del
+        // paquete que se confirma, no un seq propio del cliente.
+        if (header.flags & FLAG_RELIABLE) {
+          this.sendAck(header.seq);
+        }
         break;
       }
       case PACKET_PING: {
@@ -234,5 +328,11 @@ export class NetworkClient {
         break;
       }
     }
+  }
+
+  private sendAck(ackedSeq: number): void {
+    if (!this.serverAddr) return;
+    const packet = buildHeader(ackedSeq, ackedSeq, PACKET_ACK);
+    this.socket.send(packet, this.serverAddr.port, this.serverAddr.host);
   }
 }

@@ -17,7 +17,7 @@
 
   <script type="module">
     import { NetworkClient } from "./dist/networkcore.js";
-    import { decodeTacaTacaState } from "./dist/ejemplo-tacataca.js";
+    import { decodeTacaTacaState, ROLE_PADDLE } from "./dist/ejemplo-tacataca.js";
 
     const logEl = document.getElementById("log");
     function log(msg, cls) {
@@ -29,8 +29,11 @@
 
     // data-testid en window para que Playwright pueda leer el estado sin
     // parsear texto — ver web/README.md.
-    window.__testState = { connected: false, playerId: 0, decoded: null, pongMs: null };
+    window.__testState = { connected: false, playerId: 0, roomCode: "", decoded: null, pongMs: null };
 
+    // Esta página de prueba siempre crea una sala nueva como rolePaddle —
+    // para probar unirse a una sala existente por código, ver
+    // web/README.md (parámetro ?room=CODIGO).
     async function main() {
       logEl.textContent = "";
 
@@ -59,15 +62,22 @@
       const url = `https://${location.hostname}:9443/webtransport`;
       log(`Conectando a ${url}...`);
 
-      const connected = await client.connect(url, { certificateHashBase64: certHash });
-      if (!connected) {
-        log("Handshake falló", "err");
+      try {
+        await client.connect(url, { certificateHashBase64: certHash });
+
+        const roomCodeParam = new URLSearchParams(location.search).get("room");
+        const result = roomCodeParam
+          ? await client.joinRoom(ROLE_PADDLE, roomCodeParam)
+          : await client.createRoom(ROLE_PADDLE);
+
+        window.__testState.connected = true;
+        window.__testState.playerId = client.playerId;
+        window.__testState.roomCode = client.roomCode;
+        log(`Conectado. playerId=${client.playerId} roomCode=${client.roomCode}`, "ok");
+      } catch (e) {
+        log(`Handshake falló: ${e}`, "err");
         return;
       }
-
-      window.__testState.connected = true;
-      window.__testState.playerId = client.playerId;
-      log(`Conectado. playerId=${client.playerId}`, "ok");
 
       window.__testClient = client; // para que el test dispare inputs a mano
     }

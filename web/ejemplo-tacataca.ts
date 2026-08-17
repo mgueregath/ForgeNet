@@ -2,6 +2,13 @@
 // el lado navegador — análogo a nucleo-multiplayer/typescript/ejemplo-tacataca.ts,
 // pero con Uint8Array/DataView en vez de Buffer (Buffer no existe en el
 // navegador).
+
+// Roles de taca-taca — opacos para el core (viajan como el byte Role del
+// handshake, ver networkcore.ts), definidos y usados solo acá. Deben
+// coincidir con roleBoard/rolePaddle en go/ejemplo-tacataca/main.go.
+export const ROLE_BOARD = 0x01;
+export const ROLE_PADDLE = 0x02;
+
 export interface RodState {
   playerId: number;
   position: number;
