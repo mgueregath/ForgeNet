@@ -340,6 +340,126 @@ def test_reliable_event_retransmits_until_acked():
     server.stop()
 
 
+def test_reconnection_by_ip_preserves_identity():
+    print()
+    print("== Test 8: reconexión por IP preserva identidad (mismo PlayerID, Role original) ==")
+
+    hosts = []
+    reconnected_flags = []
+
+    def room_factory():
+        host = NetworkHost()
+        host.on_player_connected = lambda player_id, role, reconnected: reconnected_flags.append(reconnected)
+        hosts.append(host)
+        return host
+
+    server = Server(room_factory)
+    server.start_udp(29992)
+    time.sleep(0.3)
+
+    first = NetworkClient()
+    first.connect("127.0.0.1", 29992)
+    check("primera conexión (role=7)", first.create_room(role=7))
+    first_id = first.player_id
+    room_code = first.room_code
+    first.disconnect()  # simula la caída: deja de mandar heartbeat, sin avisar
+
+    # Esperar más que HEARTBEAT_TIMEOUT (10s) para que el host marque al
+    # primer cliente como desconectado (y reclamable).
+    time.sleep(11.0)
+
+    second = NetworkClient()
+    second.connect("127.0.0.1", 29992)
+    check("segunda conexión, misma IP, role distinto a propósito (role=3)", second.join_room(role=3, room_code=room_code))
+
+    check("reconexión preservó el PlayerID", second.player_id == first_id)
+    check(
+        f"se registraron 2 llamadas a on_player_connected ({len(reconnected_flags)})",
+        len(reconnected_flags) == 2,
+    )
+    if len(reconnected_flags) == 2:
+        check("la primera conexión no se marca reconnected", reconnected_flags[0] is False)
+        check("la segunda conexión sí se marca reconnected", reconnected_flags[1] is True)
+
+    host = hosts[0]
+    role = host.get_client_role(first_id)
+    check(f"Role tras reconexión es el ORIGINAL (7), no el nuevo (3) -> {role}", role == 7)
+
+    second.disconnect()
+    server.stop()
+
+
+def test_udp_port_ephemeral():
+    print()
+    print("== Test 9: puerto UDP efímero (port=0) se puede leer de vuelta con udp_port() ==")
+
+    server = Server(lambda: NetworkHost())
+    server.start_udp(0)
+    time.sleep(0.2)
+
+    port = server.udp_port()
+    check(f"udp_port() no es 0 -> {port}", port != 0)
+
+    client = NetworkClient()
+    client.connect("127.0.0.1", port)
+    check("handshake contra el puerto efímero funciona", client.create_room(role=1))
+    check("playerId asignado (>0)", client.player_id > 0)
+
+    client.disconnect()
+    server.stop()
+
+
+def test_embedded_host_mode():
+    print()
+    print("== Test 10: modo host embebido — Server.create_room() sin cliente, luego un cliente se une ==")
+
+    fake_state = bytes([9, 9, 9])
+
+    def room_factory():
+        host = NetworkHost()
+        host.state_provider = lambda: fake_state
+        return host
+
+    server = Server(room_factory)
+    server.start_udp(0)
+    time.sleep(0.2)
+
+    room_code = server.create_room()
+    check("create_room() devolvió un código de sala", bool(room_code))
+
+    mando = NetworkClient()
+    mando.connect("127.0.0.1", server.udp_port())
+    check("un cliente se une a la sala pre-creada", mando.join_room(role=1, room_code=room_code))
+    check("playerId asignado (>0)", mando.player_id > 0)
+    check("terminó en la sala pre-creada", mando.room_code == room_code)
+
+    mando.disconnect()
+    server.stop()
+
+
+def test_embedded_host_room_survives_empty_grace_period():
+    print()
+    print("== Test 11: sala pre-creada (host embebido), sin nadie todavía, sobrevive más que el grace period ==")
+
+    server = Server(lambda: NetworkHost(), empty_room_grace_period=0.3)
+    server.start_udp(0)
+    time.sleep(0.2)
+
+    room_code = server.create_room()
+
+    # Esperar bastante más que el (muy corto, a propósito) grace period —
+    # si la sala vacía-sin-nadie-nunca fuera tratada igual que una vacía-
+    # tras-tener-gente, el janitor ya la habría destruido acá.
+    time.sleep(1.0)
+
+    client = NetworkClient()
+    client.connect("127.0.0.1", server.udp_port())
+    check("la sala pre-creada no fue destruida por el janitor", client.join_room(role=1, room_code=room_code))
+
+    client.disconnect()
+    server.stop()
+
+
 if __name__ == "__main__":
     test_generic_mechanisms()
     test_heartbeat_survives()
@@ -348,6 +468,10 @@ if __name__ == "__main__":
     test_join_nonexistent_room_rejected()
     test_max_players_per_room_rejects_extra_joins()
     test_reliable_event_retransmits_until_acked()
+    test_reconnection_by_ip_preserves_identity()
+    test_udp_port_ephemeral()
+    test_embedded_host_mode()
+    test_embedded_host_room_survives_empty_grace_period()
 
     print()
     if failures == 0:

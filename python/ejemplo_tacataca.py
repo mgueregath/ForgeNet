@@ -83,12 +83,19 @@ class TacaTacaGame:
         host.on_input = lambda input: self._on_input(host, input)
         host.state_provider = self._encode_state
 
-    def _on_connected(self, player_id: int, role: int):
+    def _on_connected(self, player_id: int, role: int, reconnected: bool):
         # role es opaco para el core: acá es donde taca-taca decide qué
         # hacer con cada valor. El tablero (ROLE_BOARD) recibe el mismo
         # snapshot que todos (ve la partida completa) pero no controla
         # ninguna barra. Un mando (ROLE_PADDLE) más allá del cupo tampoco
         # recibe barra — se queda conectado, pero sin efecto en el juego.
+        #
+        # reconnected (reconexión reconocida por IP, ver
+        # NetworkHost.admit_player) no se usa acá: este ejemplo no
+        # conserva posición/rotación entre reconexiones — _on_disconnected
+        # ya borra la barra, así que reconectar arma una nueva desde cero.
+        # Un juego real que quiera conservar estado chequearía este flag
+        # para NO pisar el estado existente.
         if role != ROLE_PADDLE:
             return
         with self._lock:

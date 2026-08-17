@@ -222,7 +222,12 @@ class Peer:
     por origen UDP; ni NetworkHost ni Server necesitan saber más que esto
     de qué hay del otro lado — es lo que permite que, igual que en Go, un
     mismo Server pueda algún día rutear paquetes de otros transportes sin
-    tocar el resto del core."""
+    tocar el resto del core.
+
+    ip(): el protocolo no lleva ningún token de sesión, así que
+    admit_player usa la IP (sin el puerto, que cambia en cada reconexión —
+    nuevo socket UDP) como heurística para reconocer "es el mismo
+    dispositivo reconectándose" — ver el comentario grande ahí."""
 
     def __init__(self, sock: socket.socket, addr: Tuple[str, int]):
         self._sock = sock
@@ -236,6 +241,9 @@ class Peer:
 
     def key(self) -> Tuple[str, int]:
         return self.addr
+
+    def ip(self) -> str:
+        return self.addr[0]
 
 
 # --- NetworkHost (rol servidor de UNA sala) ---
@@ -276,7 +284,11 @@ class NetworkHost:
     """
 
     def __init__(self):
-        self.on_player_connected: Optional[Callable[[int, int], None]] = None
+        # on_player_connected(player_id, role, reconnected): reconnected=True
+        # si esto fue una reconexión reconocida por IP (ver admit_player) —
+        # el juego puede usarlo para NO pisar el estado que ya tenía ese
+        # jugador con uno vacío.
+        self.on_player_connected: Optional[Callable[[int, int, bool], None]] = None
         self.on_player_disconnected: Optional[Callable[[int], None]] = None
         self.on_input: Optional[Callable[[PlayerInput], None]] = None
         self.on_tick: Optional[Callable[[int], None]] = None
@@ -356,39 +368,75 @@ class NetworkHost:
             return len(client.reliable_queue)
 
     def connected_player_count(self) -> int:
+        """Solo cuenta connected==True — self._clients también incluye
+        clientes desconectados que quedaron "reclamables" para una
+        reconexión (ver _heartbeat_loop/admit_player), así que
+        len(self._clients) ya no alcanza."""
         with self._lock:
-            return len(self._clients)
+            return sum(1 for c in self._clients.values() if c.connected)
 
     # --- Admisión de clientes ---
 
-    def admit_player(self, peer: Peer, role: int) -> int:
-        """Registra un cliente nuevo en esta sala y dispara
-        on_player_connected(player_id, role). La llama Server, después de
-        decidir (crear/unirse) a qué sala pertenece el cliente. role es
-        opaco para el core — cada juego define sus propios valores y qué
-        hacer con ellos.
+    def admit_player(self, peer: Peer, role: int) -> Tuple[int, bool]:
+        """Registra un cliente nuevo en esta sala, o reconoce una
+        reconexión, y dispara on_player_connected(player_id, role,
+        reconnected). La llama Server, después de decidir (crear/unirse) a
+        qué sala pertenece el cliente. role es opaco para el core — cada
+        juego define sus propios valores y qué hacer con ellos.
 
-        Idempotente: un cliente que ya está admitido devuelve su player_id
-        actual sin duplicar estado (cubre el reintento de un handshake
-        cuyo ack se perdió)."""
+        Reconexión: si hay un cliente marcado desconectado (ver
+        _heartbeat_loop) con la misma IP (Peer.ip()) que quien está
+        haciendo el handshake, se le devuelve la MISMA identidad
+        (player_id, y el role ORIGINAL — no el que venga en este
+        handshake, para no perder de vista quién era) en vez de crear un
+        jugador nuevo. Es una heurística por IP, no un token de sesión (el
+        protocolo no lleva uno todavía): funciona bien en la LAN/datos
+        móviles típica, donde cada dispositivo tiene su propia IP — no es
+        a prueba de balas si dos jugadores comparten la misma IP pública
+        (NAT compartido) y ambos están desconectados a la vez.
+
+        Idempotente además en el sentido de siempre: un cliente que ya
+        está admitido (misma Peer.key(), sin pasar por desconexión)
+        devuelve su player_id actual sin duplicar estado ni disparar el
+        hook de nuevo (cubre el reintento de un handshake cuyo ack se
+        perdió). Devuelve (player_id, reconnected)."""
         key = peer.key()
 
         with self._lock:
             existing_id = self._clients_by_key.get(key)
             if existing_id is not None:
-                return existing_id
+                return existing_id, False
 
-            player_id = self._next_player_id
-            self._next_player_id += 1
+            reclaimed = None
+            ip = peer.ip()
+            if ip:
+                for c in self._clients.values():
+                    if not c.connected and c.peer.ip() == ip:
+                        reclaimed = c
+                        break
 
-            self._clients[player_id] = _ClientConnection(
-                player_id=player_id, peer=peer, role=role, last_seq=0, last_heartbeat=time.time()
-            )
-            self._clients_by_key[key] = player_id
+            if reclaimed is not None:
+                self._clients_by_key.pop(reclaimed.peer.key(), None)
+                reclaimed.peer = peer
+                reclaimed.connected = True
+                reclaimed.last_heartbeat = time.time()
+                self._clients_by_key[key] = reclaimed.player_id
+                player_id = reclaimed.player_id
+                role = reclaimed.role
+                reconnected = True
+            else:
+                player_id = self._next_player_id
+                self._next_player_id += 1
+
+                self._clients[player_id] = _ClientConnection(
+                    player_id=player_id, peer=peer, role=role, last_seq=0, last_heartbeat=time.time()
+                )
+                self._clients_by_key[key] = player_id
+                reconnected = False
 
         if self.on_player_connected:
-            self.on_player_connected(player_id, role)
-        return player_id
+            self.on_player_connected(player_id, role, reconnected)
+        return player_id, reconnected
 
     def get_client_role(self, player_id: int) -> Optional[int]:
         """Devuelve el rol opaco con el que se admitió a un jugador (ver
@@ -539,9 +587,19 @@ class NetworkHost:
                 for player_id, client in self._clients.items():
                     if now - client.last_heartbeat > HEARTBEAT_TIMEOUT:
                         to_remove.append(player_id)
+                # Solo se marca connected=False — a propósito NO se borra
+                # de self._clients: se mantiene "reclamable" por
+                # admit_player si el mismo dispositivo (misma IP) vuelve a
+                # conectarse, así el juego puede restaurar su estado en vez
+                # de tratarlo como uno nuevo. _clients_by_key sí se limpia:
+                # esa key (ej. ip:puerto UDP viejo) ya no sirve para rutear
+                # nada. El Server, por su lado, no destruye esta sala
+                # instantáneamente al quedar en 0 conectados — ver
+                # Server empty_room_grace_period.
                 for player_id in to_remove:
-                    client = self._clients.pop(player_id)
-                    del self._clients_by_key[client.peer.key()]
+                    client = self._clients[player_id]
+                    client.connected = False
+                    self._clients_by_key.pop(client.peer.key(), None)
 
             for player_id in to_remove:
                 if self.on_player_disconnected:
@@ -556,6 +614,10 @@ class _Room:
     code: str
     host: NetworkHost
     had_player: bool = False
+    # empty_since: desde cuándo host.connected_player_count() está en 0 —
+    # None mientras la sala tiene al menos un cliente conectado. Ver
+    # Server._sweep_empty_rooms.
+    empty_since: Optional[float] = None
 
 
 @dataclass
@@ -593,6 +655,7 @@ class Server:
         max_players_per_room: Optional[int] = None,
         handshake_rate_limit: int = 10,
         handshake_rate_limit_window: float = 10.0,
+        empty_room_grace_period: float = 30.0,
     ):
         self._room_factory = room_factory
         self._room_code_length = room_code_length
@@ -609,8 +672,15 @@ class Server:
         # flood simple desde una única conexión.
         self._handshake_rate_limit = handshake_rate_limit
         self._handshake_rate_limit_window = handshake_rate_limit_window
+        # empty_room_grace_period: cuánto se espera, desde que una sala que
+        # ya tuvo jugadores queda en 0 conectados, antes de destruirla — no
+        # instantáneo, para darle tiempo a admit_player de reconocer una
+        # reconexión (ver el comentario grande ahí) antes de que la sala
+        # misma deje de existir.
+        self._empty_room_grace_period = empty_room_grace_period
 
         self._sock: Optional[socket.socket] = None
+        self._udp_port = 0
         self._running = False
         self._rooms: Dict[str, _Room] = {}
         self._peers: Dict[Tuple[str, int], _PeerInfo] = {}
@@ -620,16 +690,28 @@ class Server:
         self._handshake_attempts: Dict[Tuple[str, int], Tuple[float, int]] = {}
 
     def start_udp(self, port: int):
+        """Liga un socket UDP y arranca su loop de recepción. port=0 le
+        pide al SO cualquier puerto disponible — útil para un deployment
+        que no quiere depender de que un puerto fijo esté libre. El puerto
+        real que asignó el SO queda disponible en udp_port()."""
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._sock.bind(("0.0.0.0", port))
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1 << 20)
+        self._udp_port = self._sock.getsockname()[1]
         self._running = True
 
         threading.Thread(target=self._receive_loop, daemon=True).start()
         threading.Thread(target=self._janitor_loop, daemon=True).start()
 
-        print(f"🌐 Server escuchando en :{port} (multi-sala, 60Hz por sala)")
+        print(f"🌐 Server escuchando en :{self._udp_port} (multi-sala, 60Hz por sala)")
+
+    def udp_port(self) -> int:
+        """Puerto UDP real en el que quedó escuchando el server — el mismo
+        que se pidió en start_udp, salvo que se haya pedido 0 (cualquiera
+        disponible), en cuyo caso es el que el SO asignó de verdad. 0 si
+        start_udp nunca se llamó (o falló)."""
+        return self._udp_port
 
     def stop(self):
         """Cierra el transporte y detiene todas las salas."""
@@ -711,7 +793,7 @@ class Server:
             peer.send(build_header(seq, 0, PACKET_DISCONNECT) + bytes([REASON_ROOM_FULL]))
             return
 
-        player_id = room.host.admit_player(peer, role)
+        player_id, _reconnected = room.host.admit_player(peer, role)
         room.had_player = True
 
         ack = build_header(seq, 0, PACKET_HANDSHAKE) + encode_handshake_ack(player_id, room.code)
@@ -745,6 +827,22 @@ class Server:
             for k in expired:
                 del self._handshake_attempts[k]
 
+    def create_room(self) -> str:
+        """Arranca una sala directamente, sin pasar por un handshake de
+        red — a diferencia de una sala creada porque un cliente mandó
+        HANDSHAKE_MODE_CREATE, acá no hay ningún cliente admitido todavía.
+
+        Pensado para el modo "host embebido" (ej. un tablero en LAN, que es
+        el mismo proceso que corre el Server): la app llama a esto una vez
+        al arrancar y ya tiene una sala fija a la que los mandos se unen
+        con join_room, sin que el propio tablero tenga que hacerse pasar
+        por cliente de sí mismo para "crear" la sala. La sala recién
+        creada NO cuenta como "vacía" para el janitor (ver
+        _sweep_empty_rooms/had_player) hasta que admite a su primer
+        cliente de verdad, así que puede esperar indefinidamente a que
+        alguien se una sin que empty_room_grace_period la destruya."""
+        return self._create_room().code
+
     def _create_room(self) -> _Room:
         code = self._generate_unique_room_code()
         host = self._room_factory()
@@ -771,15 +869,28 @@ class Server:
             self._sweep_handshake_attempts()
 
     def _sweep_empty_rooms(self):
-        """Destruye salas que tuvieron al menos un jugador y se quedaron
-        sin ninguno conectado. Una sala recién creada que todavía no tuvo
-        ningún cliente no se toca (had_player)."""
+        """Destruye salas que tuvieron al menos un jugador y llevan más de
+        empty_room_grace_period sin ninguno conectado — no instantáneo, para
+        darle tiempo a admit_player de reconocer una reconexión (ver el
+        comentario grande ahí) antes de que la sala misma deje de existir.
+        Una sala recién creada que todavía no tuvo ningún cliente no se
+        toca (had_player)."""
         with self._lock:
-            to_remove = [
-                code
-                for code, room in self._rooms.items()
-                if room.had_player and room.host.connected_player_count() == 0
-            ]
+            now = time.time()
+            to_remove = []
+            for code, room in self._rooms.items():
+                if not room.had_player:
+                    continue
+                if room.host.connected_player_count() > 0:
+                    room.empty_since = None
+                    continue
+                if room.empty_since is None:
+                    room.empty_since = now
+                    continue
+                if now - room.empty_since < self._empty_room_grace_period:
+                    continue
+                to_remove.append(code)
+
             for code in to_remove:
                 room = self._rooms.pop(code)
                 room.host.stop()
