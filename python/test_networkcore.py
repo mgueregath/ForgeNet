@@ -9,8 +9,15 @@ Ejecutar: python3 test_networkcore.py
 import sys
 import time
 
-from networkcore import GameEvent, GameSnapshot, NetworkClient, NetworkHost
-from ejemplo_tacataca import TacaTacaGame, TacaTacaState
+from networkcore import (
+    REASON_ROOM_FULL,
+    REASON_ROOM_NOT_FOUND,
+    GameEvent,
+    NetworkClient,
+    NetworkHost,
+    Server,
+)
+from ejemplo_tacataca import MAX_PADDLES, ROLE_BOARD, ROLE_PADDLE, TacaTacaGame, TacaTacaState
 
 failures = 0
 
@@ -25,16 +32,21 @@ def check(name: str, condition: bool):
 
 
 def test_generic_mechanisms():
-    print("== Test 1: NetworkHost <-> NetworkClient (mecanismos genéricos) ==")
+    print("== Test 1: NetworkHost <-> NetworkClient via Server (mecanismos genéricos) ==")
 
-    host = NetworkHost()
     fake_state = bytes([10, 20, 30, 40, 50])
-    host.state_provider = lambda: fake_state
-
     received_inputs = []
-    host.on_input = lambda inp: received_inputs.append(inp)
+    hosts = []
 
-    host.start(29999)
+    def room_factory():
+        host = NetworkHost()
+        host.state_provider = lambda: fake_state
+        host.on_input = lambda inp: received_inputs.append(inp)
+        hosts.append(host)
+        return host
+
+    server = Server(room_factory)
+    server.start_udp(29999)
     time.sleep(0.3)
 
     client = NetworkClient()
@@ -44,9 +56,11 @@ def test_generic_mechanisms():
         snapshot_with_event.__setitem__("value", snap) if snap.events and snapshot_with_event["value"] is None else None
     )
 
-    connected = client.connect("127.0.0.1", 29999)
-    check("handshake conecta", connected)
+    client.connect("127.0.0.1", 29999)
+    connected = client.create_room(role=1)
+    check("handshake conecta (create_room)", connected)
     check("playerId asignado (>0)", client.player_id > 0)
+    check("room_code recibido del server", bool(client.room_code))
 
     client.send_input(15, -7, 90, 0)
     client.send_input(3, 3, 45, 0x99, reliable=True)
@@ -73,6 +87,7 @@ def test_generic_mechanisms():
             client.latest_snapshot.state_payload == fake_state,
         )
 
+    host = hosts[0]
     host.queue_event(GameEvent(player_id=client.player_id, event_type=42, data=bytes([9, 9])))
     deadline = time.time() + 2
     while time.time() < deadline and snapshot_with_event["value"] is None:
@@ -93,44 +108,57 @@ def test_generic_mechanisms():
     check("ping/pong responde", pong["ms"] is not None)
 
     client.disconnect()
-    host.stop()
+    server.stop()
 
 
 def test_heartbeat_survives():
     print()
     print("== Test 2: heartbeat sobrevive >10s con actividad ==")
 
-    host = NetworkHost()
-    host.start(29998)
+    hosts = []
+
+    def room_factory():
+        host = NetworkHost()
+        hosts.append(host)
+        return host
+
+    server = Server(room_factory)
+    server.start_udp(29998)
     time.sleep(0.3)
 
     client = NetworkClient()
     client.connect("127.0.0.1", 29998)
+    client.create_room(role=1)
 
     start = time.time()
     while time.time() - start < 12:
         client.send_input(1, 1, 0, 0)
         time.sleep(0.5)
 
-    check("cliente sigue conectado en el host tras 12s", host.connected_player_count() == 1)
+    check("cliente sigue conectado en el host tras 12s", hosts[0].connected_player_count() == 1)
 
     client.disconnect()
-    host.stop()
+    server.stop()
 
 
 def test_tacataca_example():
     print()
-    print("== Test 3: ejemplo taca-taca sobre el core genérico ==")
+    print("== Test 3: ejemplo taca-taca sobre el core genérico (via Server, con role) ==")
 
-    host = NetworkHost()
-    game = TacaTacaGame()
-    game.attach_to(host)
-    host.start(29997)
+    def room_factory():
+        host = NetworkHost()
+        game = TacaTacaGame()
+        game.attach_to(host)
+        return host
+
+    server = Server(room_factory, max_players_per_room=MAX_PADDLES + 1)
+    server.start_udp(29997)
     time.sleep(0.3)
 
     client = NetworkClient()
-    connected = client.connect("127.0.0.1", 29997)
-    check("handshake conecta (taca-taca)", connected)
+    client.connect("127.0.0.1", 29997)
+    connected = client.create_room(role=ROLE_PADDLE)
+    check("handshake conecta (taca-taca, ROLE_PADDLE)", connected)
 
     client.send_input(25, 0, 30, 0)
     client.send_input(0, 0, 30, 0x01, reliable=True)  # "meter un gol"
@@ -152,14 +180,174 @@ def test_tacataca_example():
         check(f"rotación de barra aplicada (30 -> {decoded.rods[0].rotation})", decoded.rods[0].rotation == 30)
         check(f"gol contabilizado (1 -> {decoded.score_team_a})", decoded.score_team_a == 1)
 
+    # Un segundo cliente con ROLE_BOARD se une a la misma sala: debe poder
+    # conectarse (ve la partida completa) pero no ocupar cupo de barra.
+    board = NetworkClient()
+    board.connect("127.0.0.1", 29997)
+    board_connected = board.join_room(role=ROLE_BOARD, room_code=client.room_code)
+    check("tablero (ROLE_BOARD) se une a la misma sala", board_connected and board.room_code == client.room_code)
+
+    time.sleep(0.3)
+    deadline = time.time() + 2
+    still_one_rod = False
+    while time.time() < deadline:
+        snap = board.latest_snapshot
+        if snap is not None and snap.state_payload:
+            candidate = TacaTacaState.decode(snap.state_payload)
+            still_one_rod = len(candidate.rods) == 1
+            if still_one_rod:
+                break
+        time.sleep(0.05)
+    check("el tablero no ocupa cupo de barra (rods sigue en 1)", still_one_rod)
+
+    board.disconnect()
     client.disconnect()
-    host.stop()
+    server.stop()
+
+
+def test_create_and_join_room():
+    print()
+    print("== Test 4: crear sala + unirse por código termina en la misma sala ==")
+
+    created_hosts = []
+
+    def room_factory():
+        host = NetworkHost()
+        created_hosts.append(host)
+        return host
+
+    server = Server(room_factory)
+    server.start_udp(29996)
+    time.sleep(0.3)
+
+    creator = NetworkClient()
+    creator.connect("127.0.0.1", 29996)
+    check("creador conecta (create_room)", creator.create_room(role=1))
+    check("creador recibió un código de sala", bool(creator.room_code))
+
+    joiner = NetworkClient()
+    joiner.connect("127.0.0.1", 29996)
+    check("joiner se une con el código del creador", joiner.join_room(role=2, room_code=creator.room_code))
+    check("joiner terminó en la misma sala", joiner.room_code == creator.room_code)
+    check("PlayerIDs distintos", creator.player_id != joiner.player_id)
+    check(f"se creó una sola sala ({len(created_hosts)})", len(created_hosts) == 1)
+    if created_hosts:
+        check(
+            f"2 clientes conectados en la sala ({created_hosts[0].connected_player_count()})",
+            created_hosts[0].connected_player_count() == 2,
+        )
+
+    creator.disconnect()
+    joiner.disconnect()
+    server.stop()
+
+
+def test_join_nonexistent_room_rejected():
+    print()
+    print("== Test 5: unirse a una sala inexistente es rechazado ==")
+
+    server = Server(lambda: NetworkHost())
+    server.start_udp(29995)
+    time.sleep(0.3)
+
+    client = NetworkClient()
+    client.connect("127.0.0.1", 29995)
+    ok = client.join_room(role=1, room_code="ZZZZZZ")
+    check("join a sala inexistente falla", not ok)
+    check("motivo de rechazo es ReasonRoomNotFound", client.last_reject_reason == REASON_ROOM_NOT_FOUND)
+
+    server.stop()
+
+
+def test_max_players_per_room_rejects_extra_joins():
+    print()
+    print("== Test 6: max_players_per_room rechaza joins de más (tope numérico) ==")
+
+    server = Server(lambda: NetworkHost(), max_players_per_room=2)
+    server.start_udp(29994)
+    time.sleep(0.3)
+
+    creator = NetworkClient()
+    creator.connect("127.0.0.1", 29994)
+    creator.create_room(role=1)
+
+    second = NetworkClient()
+    second.connect("127.0.0.1", 29994)
+    check("segundo cliente entra dentro del tope", second.join_room(role=1, room_code=creator.room_code))
+
+    third = NetworkClient()
+    third.connect("127.0.0.1", 29994)
+    ok = third.join_room(role=1, room_code=creator.room_code)
+    check("tercer cliente rechazado por tope", not ok)
+    check("motivo de rechazo es ReasonRoomFull", third.last_reject_reason == REASON_ROOM_FULL)
+
+    creator.disconnect()
+    second.disconnect()
+    server.stop()
+
+
+def test_reliable_event_retransmits_until_acked():
+    print()
+    print("== Test 7: evento reliable se retransmite hasta ser confirmado ==")
+
+    hosts = []
+
+    def room_factory():
+        host = NetworkHost()
+        hosts.append(host)
+        return host
+
+    server = Server(room_factory)
+    server.start_udp(29993)
+    time.sleep(0.3)
+
+    client = NetworkClient()
+    client.connect("127.0.0.1", 29993)
+    client.create_room(role=1)
+
+    received = {"event": None}
+
+    def on_snapshot(snap):
+        if snap.events and received["event"] is None:
+            received["event"] = snap.events[0]
+
+    client.on_snapshot = on_snapshot
+
+    host = hosts[0]
+    host.queue_reliable_event(GameEvent(player_id=client.player_id, event_type=9, data=bytes([7])))
+
+    deadline = time.time() + 2
+    while time.time() < deadline and received["event"] is None:
+        time.sleep(0.02)
+    check("evento reliable llega al cliente", received["event"] is not None)
+    if received["event"] is not None:
+        check("event_type preservado (9)", received["event"].event_type == 9)
+        check("data preservada ([7])", received["event"].data == bytes([7]))
+
+    # El cliente confirma automáticamente al recibir un PacketSnapshot con
+    # FLAG_RELIABLE (ver NetworkClient._handle_packet) — la cola de
+    # retransmisión del host debe vaciarse solita, sin que el test tenga
+    # que ackear a mano.
+    deadline = time.time() + 1
+    while time.time() < deadline and host.pending_reliable_count(client.player_id) != 0:
+        time.sleep(0.02)
+    check(
+        "la cola de retransmisión se vació tras el ack del cliente",
+        host.pending_reliable_count(client.player_id) == 0,
+    )
+
+    client.disconnect()
+    server.stop()
 
 
 if __name__ == "__main__":
     test_generic_mechanisms()
     test_heartbeat_survives()
     test_tacataca_example()
+    test_create_and_join_room()
+    test_join_nonexistent_room_rejected()
+    test_max_players_per_room_rejects_extra_joins()
+    test_reliable_event_retransmits_until_acked()
 
     print()
     if failures == 0:

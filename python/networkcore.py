@@ -7,11 +7,14 @@ que los cores en Go, Rust y C#. Misma spec de protocolo binario: comparten
 framing con esos tres, y ahora también el formato de snapshot genérico
 (Tick + StatePayload opaco + Events).
 
-Incluye NetworkHost (rol servidor) y NetworkClient (rol cliente) — a
-diferencia de Go/Rust/C++ (solo servidor) y TypeScript (solo cliente),
-Python siempre tuvo ambos roles en este proyecto.
+Incluye NetworkHost (rol servidor de UNA sala/partida), Server (multiplexa
+muchas salas concurrentes sobre el mismo socket — ver server.go en Go) y
+NetworkClient (rol cliente) — a diferencia de Go/Rust/C++ (solo servidor) y
+TypeScript (solo cliente), Python siempre tuvo ambos roles en este
+proyecto, así que acá vive el mirror completo del split Go host.go/server.go.
 """
 
+import random
 import socket
 import struct
 import threading
@@ -40,6 +43,24 @@ HEARTBEAT_EVERY = 1.0
 HEARTBEAT_TIMEOUT = 10.0
 MAX_RETRIES = 3
 
+# --- Payload del handshake (join) ---
+#
+# El core no sabe qué juego corre encima, así que role viaja como un byte
+# opaco: cada juego define sus propios valores y su propio significado (ej.
+# taca-taca usa un valor para "barra" y otro para "tablero" — ver
+# ejemplo_tacataca.py), igual que ya pasa con state_payload y
+# GameEvent.event_type.
+
+# Modos de handshake — quién crea una sala nueva vs. quién se une a una
+# existente por código. Esto sí es genérico: cualquier juego con sesiones
+# de partida necesita esta distinción.
+HANDSHAKE_MODE_CREATE = 0x00
+HANDSHAKE_MODE_JOIN = 0x01
+
+# Motivos de rechazo del handshake, enviados en un PACKET_DISCONNECT.
+REASON_ROOM_NOT_FOUND = 0x01
+REASON_ROOM_FULL = 0x02
+
 
 def build_header(seq: int, ack: int, packet_type: int, flags: int = 0) -> bytes:
     return struct.pack(">IIB", seq, ack, (packet_type & 0x0F) | ((flags & 0x0F) << 4))
@@ -50,6 +71,41 @@ def parse_header(data: bytes) -> Optional[Tuple[int, int, int, int]]:
         return None
     seq, ack, type_and_flags = struct.unpack(">IIB", data[:HEADER_SIZE])
     return seq, ack, type_and_flags & 0x0F, (type_and_flags >> 4) & 0x0F
+
+
+def encode_join_payload(mode: int, role: int, room_code: str) -> bytes:
+    """Mode(1) + Role(1) + RoomCodeLen(1) + RoomCode(N). Va después del
+    header en un PACKET_HANDSHAKE mandado por el cliente. room_code se
+    ignora en HANDSHAKE_MODE_CREATE (el server genera el código)."""
+    room_bytes = room_code.encode("ascii")
+    return bytes([mode, role, len(room_bytes)]) + room_bytes
+
+
+def decode_join_payload(payload: bytes) -> Optional[Tuple[int, int, str]]:
+    if len(payload) < 3:
+        return None
+    code_len = payload[2]
+    if len(payload) < 3 + code_len:
+        return None
+    return payload[0], payload[1], payload[3 : 3 + code_len].decode("ascii")
+
+
+def encode_handshake_ack(player_id: int, room_code: str) -> bytes:
+    """PlayerID(2) + RoomCodeLen(1) + RoomCode(N). Va después del header en
+    la respuesta del server — tanto quien crea la sala como quien se une
+    reciben el código, para poder compartirlo (ej. un QR)."""
+    room_bytes = room_code.encode("ascii")
+    return struct.pack(">H", player_id) + bytes([len(room_bytes)]) + room_bytes
+
+
+def decode_handshake_ack(payload: bytes) -> Optional[Tuple[int, str]]:
+    if len(payload) < 3:
+        return None
+    player_id = struct.unpack(">H", payload[:2])[0]
+    code_len = payload[2]
+    if len(payload) < 3 + code_len:
+        return None
+    return player_id, payload[3 : 3 + code_len].decode("ascii")
 
 
 # --- Tipos genéricos ---
@@ -157,7 +213,32 @@ def decode_input_payload(payload: bytes) -> Optional[Tuple[int, int, int, int]]:
     return struct.unpack(">hhHI", payload[:10])
 
 
-# --- NetworkHost (rol servidor) ---
+# --- Peer: abstracción mínima de transporte ---
+
+
+class Peer:
+    """Cualquier cosa que pueda mandar bytes crudos y tenga una clave
+    estable de peer (ver Peer en Go, host.go). Server crea una instancia
+    por origen UDP; ni NetworkHost ni Server necesitan saber más que esto
+    de qué hay del otro lado — es lo que permite que, igual que en Go, un
+    mismo Server pueda algún día rutear paquetes de otros transportes sin
+    tocar el resto del core."""
+
+    def __init__(self, sock: socket.socket, addr: Tuple[str, int]):
+        self._sock = sock
+        self.addr = addr
+
+    def send(self, data: bytes):
+        try:
+            self._sock.sendto(data, self.addr)
+        except OSError:
+            pass
+
+    def key(self) -> Tuple[str, int]:
+        return self.addr
+
+
+# --- NetworkHost (rol servidor de UNA sala) ---
 
 
 @dataclass
@@ -170,8 +251,14 @@ class _ReliableMessage:
 
 @dataclass
 class _ClientConnection:
+    """Estado de sesión de un cliente. No tiene ningún campo de estado de
+    juego — eso vive en el juego, no acá. role es opaco: el core lo guarda
+    y lo expone (ver NetworkHost.get_client_role) pero nunca lo interpreta
+    — cada juego define sus propios valores y qué significan."""
+
     player_id: int
-    addr: Tuple[str, int]
+    peer: Peer
+    role: int
     last_seq: int
     last_heartbeat: float
     ping: int = 0
@@ -180,22 +267,24 @@ class _ClientConnection:
 
 
 class NetworkHost:
-    """Rol "servidor" del protocolo. No sabe nada del juego que corre
-    encima — se engancha vía los callbacks de abajo, igual que NetworkHost
-    en los cores de Go/Rust/C#.
+    """Rol "servidor" del protocolo para UNA sala/partida. No sabe nada del
+    juego que corre encima — se engancha vía los callbacks de abajo, igual
+    que NetworkHost en los cores de Go/Rust/C#. Tampoco sabe a qué sala
+    pertenece ni posee ningún socket: eso lo decide y lo posee Server, que
+    crea una instancia de NetworkHost por sala y le rutea sus paquetes (ver
+    clase Server más abajo).
     """
 
     def __init__(self):
-        self.on_player_connected: Optional[Callable[[int], None]] = None
+        self.on_player_connected: Optional[Callable[[int, int], None]] = None
         self.on_player_disconnected: Optional[Callable[[int], None]] = None
         self.on_input: Optional[Callable[[PlayerInput], None]] = None
         self.on_tick: Optional[Callable[[int], None]] = None
         self.state_provider: Optional[Callable[[], bytes]] = None
 
-        self._sock: Optional[socket.socket] = None
         self._running = False
         self._clients: Dict[int, _ClientConnection] = {}
-        self._clients_by_addr: Dict[Tuple[str, int], int] = {}
+        self._clients_by_key: Dict[Tuple[str, int], int] = {}
         self._lock = threading.RLock()
         self._next_player_id = 1
         self._sequence_counter = 0
@@ -203,84 +292,135 @@ class NetworkHost:
         self._pending_events: List[GameEvent] = []
         self._events_lock = threading.Lock()
 
-    def start(self, port: int):
-        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self._sock.bind(("0.0.0.0", port))
-        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
-        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1 << 20)
+    def start(self):
+        """Arranca el tick loop, la retransmisión de confiables y el
+        heartbeat de esta sala. La llama Server exactamente una vez, al
+        crear la sala — no abre ningún socket (eso es responsabilidad de
+        Server, que es quien lo posee)."""
         self._running = True
-
-        threading.Thread(target=self._receive_loop, daemon=True).start()
         threading.Thread(target=self._game_loop, daemon=True).start()
         threading.Thread(target=self._send_loop, daemon=True).start()
         threading.Thread(target=self._heartbeat_loop, daemon=True).start()
 
-        print(f"🎮 NetworkHost escuchando en :{port} (60Hz)")
-
     def stop(self):
+        """Detiene los loops de fondo de esta sala. No toca ningún
+        transporte — eso es responsabilidad de Server."""
         self._running = False
-        if self._sock:
-            self._sock.close()
 
     def queue_event(self, evt: GameEvent):
         """El juego encola sus propios eventos (ej. GOAL) para que salgan
-        en el próximo snapshot."""
+        en el próximo snapshot. Entrega "mejor esfuerzo": si el paquete se
+        pierde, el evento no vuelve a mandarse — para eso ver
+        queue_reliable_event."""
         with self._events_lock:
             self._pending_events.append(evt)
+
+    def queue_reliable_event(self, evt: GameEvent):
+        """Hace lo mismo que queue_event (el evento sale en el próximo
+        snapshot de todos modos) pero además lo manda ya mismo, a cada
+        cliente conectado, como un paquete aparte marcado FLAG_RELIABLE —
+        el core lo reintenta (mismo mecanismo que ya existía para reliable
+        input, ver _send_loop) hasta que el cliente lo confirma con
+        PACKET_ACK o se agotan los reintentos.
+
+        La entrega es "al menos una vez", no "exactamente una vez": el
+        cliente puede recibir el mismo evento acá y de nuevo en el
+        snapshot normal — el juego debe tratarlo como una notificación
+        idempotente, no como algo que suma un contador él mismo."""
+        self.queue_event(evt)
+
+        snapshot = GameSnapshot(tick=self._tick, timestamp=int(time.time() * 1000), events=[evt])
+        payload = snapshot.encode()
+
+        with self._lock:
+            clients = list(self._clients.values())
+
+        for client in clients:
+            with self._lock:
+                self._sequence_counter += 1
+                seq = self._sequence_counter
+            packet = build_header(seq, 0, PACKET_SNAPSHOT, FLAG_RELIABLE) + payload
+
+            with self._lock:
+                client.reliable_queue.append(_ReliableMessage(seq=seq, data=packet, sent=time.time()))
+            client.peer.send(packet)
+
+    def pending_reliable_count(self, player_id: int) -> int:
+        """Cuántos paquetes reliable (ver queue_reliable_event) todavía no
+        fueron confirmados por este cliente. Diagnóstico genérico, no
+        específico de ningún evento en particular."""
+        with self._lock:
+            client = self._clients.get(player_id)
+            if client is None:
+                return 0
+            return len(client.reliable_queue)
 
     def connected_player_count(self) -> int:
         with self._lock:
             return len(self._clients)
 
-    # --- Recepción ---
+    # --- Admisión de clientes ---
 
-    def _receive_loop(self):
-        while self._running:
-            try:
-                data, addr = self._sock.recvfrom(2048)
-            except OSError:
-                if self._running:
-                    continue
-                return
-            self._handle_packet(data, addr)
+    def admit_player(self, peer: Peer, role: int) -> int:
+        """Registra un cliente nuevo en esta sala y dispara
+        on_player_connected(player_id, role). La llama Server, después de
+        decidir (crear/unirse) a qué sala pertenece el cliente. role es
+        opaco para el core — cada juego define sus propios valores y qué
+        hacer con ellos.
 
-    def _handle_packet(self, data: bytes, addr: Tuple[str, int]):
+        Idempotente: un cliente que ya está admitido devuelve su player_id
+        actual sin duplicar estado (cubre el reintento de un handshake
+        cuyo ack se perdió)."""
+        key = peer.key()
+
+        with self._lock:
+            existing_id = self._clients_by_key.get(key)
+            if existing_id is not None:
+                return existing_id
+
+            player_id = self._next_player_id
+            self._next_player_id += 1
+
+            self._clients[player_id] = _ClientConnection(
+                player_id=player_id, peer=peer, role=role, last_seq=0, last_heartbeat=time.time()
+            )
+            self._clients_by_key[key] = player_id
+
+        if self.on_player_connected:
+            self.on_player_connected(player_id, role)
+        return player_id
+
+    def get_client_role(self, player_id: int) -> Optional[int]:
+        """Devuelve el rol opaco con el que se admitió a un jugador (ver
+        admit_player). None si el jugador no existe (ya desconectado, o id
+        inválido)."""
+        with self._lock:
+            client = self._clients.get(player_id)
+            return client.role if client is not None else None
+
+    # --- Recepción: punto de entrada común para cualquier transporte ---
+
+    def handle_packet(self, data: bytes, peer: Peer):
+        """Procesa un paquete crudo recibido de un Peer que YA pertenece a
+        esta sala. El handshake no pasa por acá: es Server quien lo
+        intercepta primero para decidir a qué sala corresponde y recién
+        ahí llama a admit_player (ver clase Server)."""
         parsed = parse_header(data)
         if parsed is None:
             return
         seq, _ack, packet_type, flags = parsed
         payload = data[HEADER_SIZE:]
 
-        if packet_type == PACKET_HANDSHAKE:
-            self._handle_handshake(seq, addr)
-        elif packet_type == PACKET_INPUT:
-            self._handle_input(seq, addr, flags, payload)
+        if packet_type == PACKET_INPUT:
+            self._handle_input(seq, peer, flags, payload)
         elif packet_type == PACKET_ACK:
-            self._handle_ack(seq, addr)
+            self._handle_ack(seq, peer)
         elif packet_type == PACKET_PING:
-            self._handle_ping(seq, addr, payload)
+            self._handle_ping(seq, peer, payload)
 
-    def _handle_handshake(self, seq: int, addr: Tuple[str, int]):
+    def _handle_input(self, seq: int, peer: Peer, flags: int, payload: bytes):
         with self._lock:
-            if addr in self._clients_by_addr:
-                return
-            player_id = self._next_player_id
-            self._next_player_id += 1
-
-            self._clients[player_id] = _ClientConnection(
-                player_id=player_id, addr=addr, last_seq=seq, last_heartbeat=time.time()
-            )
-            self._clients_by_addr[addr] = player_id
-
-        response = build_header(seq, 0, PACKET_HANDSHAKE) + struct.pack(">H", player_id)
-        self._sock.sendto(response, addr)
-
-        if self.on_player_connected:
-            self.on_player_connected(player_id)
-
-    def _handle_input(self, seq: int, addr: Tuple[str, int], flags: int, payload: bytes):
-        with self._lock:
-            player_id = self._clients_by_addr.get(addr)
+            player_id = self._clients_by_key.get(peer.key())
             if player_id is None:
                 return
             client = self._clients[player_id]
@@ -292,8 +432,7 @@ class NetworkHost:
         delta_x, delta_y, rotation, actions = decoded
 
         if flags & FLAG_RELIABLE:
-            ack = build_header(seq, seq, PACKET_ACK)
-            self._sock.sendto(ack, addr)
+            client.peer.send(build_header(seq, seq, PACKET_ACK))
 
         if self.on_input:
             self.on_input(
@@ -308,30 +447,30 @@ class NetworkHost:
                 )
             )
 
-    def _handle_ack(self, seq: int, addr: Tuple[str, int]):
+    def _handle_ack(self, seq: int, peer: Peer):
         with self._lock:
-            player_id = self._clients_by_addr.get(addr)
+            player_id = self._clients_by_key.get(peer.key())
             if player_id is None:
                 return
             client = self._clients[player_id]
             client.last_heartbeat = time.time()
             client.reliable_queue = [m for m in client.reliable_queue if m.seq > seq]
 
-    def _handle_ping(self, seq: int, addr: Tuple[str, int], payload: bytes):
+    def _handle_ping(self, seq: int, peer: Peer, payload: bytes):
         if len(payload) < 8:
             return
         client_time = struct.unpack(">q", payload[:8])[0]
         server_time = int(time.time() * 1000)
 
         with self._lock:
-            player_id = self._clients_by_addr.get(addr)
+            player_id = self._clients_by_key.get(peer.key())
             if player_id is not None:
                 client = self._clients[player_id]
                 client.ping = (server_time - client_time) // 2
                 client.last_heartbeat = time.time()
 
         response = build_header(seq, 0, PACKET_PING) + struct.pack(">q", server_time)
-        self._sock.sendto(response, addr)
+        peer.send(response)
 
     # --- Tick de juego ---
 
@@ -369,10 +508,7 @@ class NetworkHost:
         for client in clients:
             if not client.connected:
                 continue
-            try:
-                self._sock.sendto(packet, client.addr)
-            except OSError:
-                pass
+            client.peer.send(packet)
 
     # --- Retransmisión de confiables ---
 
@@ -387,10 +523,7 @@ class NetworkHost:
             for client in clients:
                 for msg in client.reliable_queue:
                     if now - msg.sent > RETRY_INTERVAL and msg.retries < MAX_RETRIES:
-                        try:
-                            self._sock.sendto(msg.data, client.addr)
-                        except OSError:
-                            pass
+                        client.peer.send(msg.data)
                         msg.sent = now
                         msg.retries += 1
 
@@ -408,11 +541,251 @@ class NetworkHost:
                         to_remove.append(player_id)
                 for player_id in to_remove:
                     client = self._clients.pop(player_id)
-                    del self._clients_by_addr[client.addr]
+                    del self._clients_by_key[client.peer.key()]
 
             for player_id in to_remove:
                 if self.on_player_disconnected:
                     self.on_player_disconnected(player_id)
+
+
+# --- Server (multiplexa muchas salas concurrentes) ---
+
+
+@dataclass
+class _Room:
+    code: str
+    host: NetworkHost
+    had_player: bool = False
+
+
+@dataclass
+class _PeerInfo:
+    """Recuerda a qué sala pertenece cada Peer y guarda el último ack de
+    handshake mandado, para poder responder handshakes reintentados (ack
+    perdido) sin volver a admitir al cliente ni crear una sala nueva."""
+
+    room_code: str
+    ack: bytes
+
+
+# room_code_alphabet excluye 0/O y 1/I — ambiguos al leerlos a mano si el
+# QR falla y alguien tiene que tipear el código.
+ROOM_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+
+
+class Server:
+    """Multiplexa muchas salas (partidas) concurrentes sobre el mismo
+    socket UDP compartido — genérico, no sabe qué juego corre en cada una.
+    Un cliente que manda PACKET_HANDSHAKE con HANDSHAKE_MODE_CREATE arranca
+    una sala nueva y recibe un código; con HANDSHAKE_MODE_JOIN se une a la
+    sala de ese código. Todo lo demás (input, ack, ping) se rutea a la sala
+    del cliente que lo mandó. Mismo diseño que Server en Go (server.go).
+
+    room_factory crea un NetworkHost nuevo, con sus propios hooks, cada vez
+    que se crea una sala — cada juego decide qué enganchar (ver
+    ejemplo_tacataca.py), el Server no sabe nada de eso.
+    """
+
+    def __init__(
+        self,
+        room_factory: Callable[[], NetworkHost],
+        room_code_length: int = 6,
+        max_players_per_room: Optional[int] = None,
+        handshake_rate_limit: int = 10,
+        handshake_rate_limit_window: float = 10.0,
+    ):
+        self._room_factory = room_factory
+        self._room_code_length = room_code_length
+        # max_players_per_room: tope de clientes admitidos por sala (None o
+        # 0 = sin tope). El Server solo cuenta clientes — no sabe qué rol
+        # tiene cada uno, así que un límite que dependa del rol (ej. "2
+        # barras + 1 tablero" en taca-taca) es responsabilidad del juego,
+        # no de acá (ver ejemplo_tacataca.py).
+        self._max_players_per_room = max_players_per_room
+        # handshake_rate_limit / _window: máximo de paquetes de handshake
+        # aceptados desde un mismo Peer por ventana — el resto se descarta
+        # en silencio. No protege contra un atacante que rota de origen en
+        # cada intento; sí frena un cliente roto reintentando en loop o un
+        # flood simple desde una única conexión.
+        self._handshake_rate_limit = handshake_rate_limit
+        self._handshake_rate_limit_window = handshake_rate_limit_window
+
+        self._sock: Optional[socket.socket] = None
+        self._running = False
+        self._rooms: Dict[str, _Room] = {}
+        self._peers: Dict[Tuple[str, int], _PeerInfo] = {}
+        self._lock = threading.RLock()
+
+        self._handshake_lock = threading.Lock()
+        self._handshake_attempts: Dict[Tuple[str, int], Tuple[float, int]] = {}
+
+    def start_udp(self, port: int):
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._sock.bind(("0.0.0.0", port))
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1 << 20)
+        self._running = True
+
+        threading.Thread(target=self._receive_loop, daemon=True).start()
+        threading.Thread(target=self._janitor_loop, daemon=True).start()
+
+        print(f"🌐 Server escuchando en :{port} (multi-sala, 60Hz por sala)")
+
+    def stop(self):
+        """Cierra el transporte y detiene todas las salas."""
+        self._running = False
+        if self._sock:
+            self._sock.close()
+
+        with self._lock:
+            rooms = list(self._rooms.values())
+            self._rooms = {}
+            self._peers = {}
+        for room in rooms:
+            room.host.stop()
+
+    # --- Recepción ---
+
+    def _receive_loop(self):
+        while self._running:
+            try:
+                data, addr = self._sock.recvfrom(2048)
+            except OSError:
+                if self._running:
+                    continue
+                return
+            self.handle_packet(data, Peer(self._sock, addr))
+
+    def handle_packet(self, data: bytes, peer: Peer):
+        """Punto de entrada común para cualquier transporte — igual que
+        NetworkHost.handle_packet, pero a nivel Server, porque el Server es
+        quien sabe a qué sala pertenece cada paquete."""
+        parsed = parse_header(data)
+        if parsed is None:
+            return
+        seq, _ack, packet_type, _flags = parsed
+
+        if packet_type == PACKET_HANDSHAKE:
+            self._handle_handshake(seq, peer, data[HEADER_SIZE:])
+            return
+
+        with self._lock:
+            info = self._peers.get(peer.key())
+            room = self._rooms.get(info.room_code) if info is not None else None
+        if room is None:
+            return
+        room.host.handle_packet(data, peer)
+
+    def _handle_handshake(self, seq: int, peer: Peer, payload: bytes):
+        key = peer.key()
+
+        if not self._allow_handshake_attempt(key):
+            return
+
+        # Reintento de un handshake ya admitido (el ack anterior se
+        # perdió): no crear una sala nueva ni volver a admitir, solo
+        # reenviar el ack.
+        with self._lock:
+            info = self._peers.get(key)
+        if info is not None:
+            peer.send(info.ack)
+            return
+
+        decoded = decode_join_payload(payload)
+        if decoded is None:
+            return
+        mode, role, room_code = decoded
+
+        if mode == HANDSHAKE_MODE_CREATE:
+            room = self._create_room()
+        elif mode == HANDSHAKE_MODE_JOIN:
+            with self._lock:
+                room = self._rooms.get(room_code)
+            if room is None:
+                peer.send(build_header(seq, 0, PACKET_DISCONNECT) + bytes([REASON_ROOM_NOT_FOUND]))
+                return
+        else:
+            return
+
+        if self._max_players_per_room and room.host.connected_player_count() >= self._max_players_per_room:
+            peer.send(build_header(seq, 0, PACKET_DISCONNECT) + bytes([REASON_ROOM_FULL]))
+            return
+
+        player_id = room.host.admit_player(peer, role)
+        room.had_player = True
+
+        ack = build_header(seq, 0, PACKET_HANDSHAKE) + encode_handshake_ack(player_id, room.code)
+        peer.send(ack)
+
+        with self._lock:
+            self._peers[key] = _PeerInfo(room_code=room.code, ack=ack)
+
+    def _allow_handshake_attempt(self, key: Tuple[str, int]) -> bool:
+        """Ventana fija, no token bucket: simple y suficiente para lo que
+        protege (ver handshake_rate_limit en __init__)."""
+        with self._handshake_lock:
+            now = time.time()
+            window = self._handshake_attempts.get(key)
+            if window is None or now - window[0] > self._handshake_rate_limit_window:
+                self._handshake_attempts[key] = (now, 1)
+                return True
+            start, count = window
+            if count >= self._handshake_rate_limit:
+                return False
+            self._handshake_attempts[key] = (start, count + 1)
+            return True
+
+    def _sweep_handshake_attempts(self):
+        with self._handshake_lock:
+            now = time.time()
+            expired = [
+                k for k, (start, _count) in self._handshake_attempts.items()
+                if now - start > self._handshake_rate_limit_window
+            ]
+            for k in expired:
+                del self._handshake_attempts[k]
+
+    def _create_room(self) -> _Room:
+        code = self._generate_unique_room_code()
+        host = self._room_factory()
+        host.start()
+
+        room = _Room(code=code, host=host)
+        with self._lock:
+            self._rooms[code] = room
+        return room
+
+    def _generate_unique_room_code(self) -> str:
+        while True:
+            code = "".join(random.choice(ROOM_CODE_ALPHABET) for _ in range(self._room_code_length))
+            with self._lock:
+                if code not in self._rooms:
+                    return code
+
+    # --- Janitor: destruye salas vacías ---
+
+    def _janitor_loop(self):
+        while self._running:
+            time.sleep(5.0)
+            self._sweep_empty_rooms()
+            self._sweep_handshake_attempts()
+
+    def _sweep_empty_rooms(self):
+        """Destruye salas que tuvieron al menos un jugador y se quedaron
+        sin ninguno conectado. Una sala recién creada que todavía no tuvo
+        ningún cliente no se toca (had_player)."""
+        with self._lock:
+            to_remove = [
+                code
+                for code, room in self._rooms.items()
+                if room.had_player and room.host.connected_player_count() == 0
+            ]
+            for code in to_remove:
+                room = self._rooms.pop(code)
+                room.host.stop()
+                for peer_key, info in list(self._peers.items()):
+                    if info.room_code == code:
+                        del self._peers[peer_key]
 
 
 # --- NetworkClient (rol cliente) ---
@@ -420,13 +793,21 @@ class NetworkHost:
 
 class NetworkClient:
     """Rol "cliente" del protocolo — usado tanto por el mando (siempre)
-    como por cualquier otro cliente Python que hable con un NetworkHost."""
+    como por cualquier otro cliente Python que hable con un Server/
+    NetworkHost. connect() solo abre el socket; create_room()/join_room()
+    hacen el handshake propiamente dicho, porque ahora el server necesita
+    saber el modo (crear/unirse), el role opaco del cliente y, si
+    corresponde, a qué código de sala unirse — ver encode_join_payload."""
 
     def __init__(self):
         self.player_id: int = 0
+        self.room_code: str = ""
         self.connected = False
         self.last_ping_ms: int = 0
         self.latest_snapshot: Optional[GameSnapshot] = None
+        # Motivo del último rechazo de handshake (REASON_ROOM_NOT_FOUND /
+        # REASON_ROOM_FULL), o None si el último intento no fue rechazado.
+        self.last_reject_reason: Optional[int] = None
 
         self.on_snapshot: Optional[Callable[[GameSnapshot], None]] = None
         self.on_pong: Optional[Callable[[int], None]] = None
@@ -438,22 +819,54 @@ class NetworkClient:
         self._pending_pings: Dict[int, float] = {}
         self._ping_lock = threading.Lock()
 
-    def connect(self, host: str, port: int, timeout: float = 3.0) -> bool:
+    def connect(self, host: str, port: int, timeout: float = 3.0):
+        """Abre el socket hacia el server, sin unirse a ninguna sala
+        todavía — usar create_room()/join_room() para eso."""
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._sock.settimeout(timeout)
         self._server_addr = (host, port)
 
-        self._sock.sendto(build_header(0, 0, PACKET_HANDSHAKE), self._server_addr)
+    def create_room(self, role: int) -> bool:
+        """Crea una sala nueva (HANDSHAKE_MODE_CREATE) y se une a ella.
+        role es opaco para el core — su significado lo define el juego
+        (ver ejemplo_tacataca.py). Tras un create_room exitoso, room_code
+        queda seteado con el código que asignó el server (para compartir,
+        ej. como QR)."""
+        return self._handshake(HANDSHAKE_MODE_CREATE, role, "")
+
+    def join_room(self, role: int, room_code: str) -> bool:
+        """Se une a una sala existente por código (HANDSHAKE_MODE_JOIN)."""
+        return self._handshake(HANDSHAKE_MODE_JOIN, role, room_code)
+
+    def _handshake(self, mode: int, role: int, room_code: str) -> bool:
+        if self._sock is None or self._server_addr is None:
+            return False
+
+        self.last_reject_reason = None
+        payload = encode_join_payload(mode, role, room_code)
+        request = build_header(0, 0, PACKET_HANDSHAKE) + payload
+        self._sock.sendto(request, self._server_addr)
+
         try:
             response, _ = self._sock.recvfrom(64)
         except socket.timeout:
             return False
 
         parsed = parse_header(response)
-        if parsed is None or parsed[2] != PACKET_HANDSHAKE or len(response) < 11:
+        if parsed is None:
+            return False
+        _seq, _ack, packet_type, _flags = parsed
+
+        if packet_type == PACKET_DISCONNECT:
+            self.last_reject_reason = response[HEADER_SIZE] if len(response) > HEADER_SIZE else None
+            return False
+        if packet_type != PACKET_HANDSHAKE:
             return False
 
-        self.player_id = struct.unpack(">H", response[9:11])[0]
+        decoded = decode_handshake_ack(response[HEADER_SIZE:])
+        if decoded is None:
+            return False
+        self.player_id, self.room_code = decoded
         self.connected = True
         self._running = True
 
@@ -501,10 +914,16 @@ class NetworkClient:
         parsed = parse_header(data)
         if parsed is None:
             return
-        seq, _ack, packet_type, _flags = parsed
+        seq, _ack, packet_type, flags = parsed
         payload = data[HEADER_SIZE:]
 
         if packet_type == PACKET_SNAPSHOT:
+            if flags & FLAG_RELIABLE:
+                # Convención de este protocolo (ver NetworkHost.sendAck en
+                # Go): el ack de un paquete reliable puntual lleva el seq
+                # del paquete recibido en AMBOS campos del header, seq y
+                # ack.
+                self._sock.sendto(build_header(seq, seq, PACKET_ACK), self._server_addr)
             snapshot = GameSnapshot.decode(payload)
             if snapshot is not None:
                 self.latest_snapshot = snapshot

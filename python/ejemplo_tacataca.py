@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Ejemplo de "juego" construido ENCIMA de networkcore.py, no dentro de él.
 
-Prueba que el core es de verdad genérico: NetworkHost no sabe qué es una
-"barra" ni una "pelota" — este módulo es el que define ese esquema y lo
-conecta a los hooks genéricos (on_input/on_tick/state_provider/queue_event).
+Prueba que el core es de verdad genérico: ni NetworkHost ni Server saben
+qué es una "barra", una "pelota" ni un "tablero" — este módulo es el que
+define ese esquema y lo conecta a los hooks genéricos
+(on_input/on_tick/state_provider/queue_event), incluido el significado de
+role, que el core solo transporta sin interpretar.
 Análogo a nucleo-multiplayer/csharp/NetworkCore.Tests/TacaTacaExample.cs y
 nucleo-multiplayer/go/ejemplo-tacataca/main.go.
 """
@@ -13,9 +15,21 @@ import threading
 from dataclasses import dataclass, field
 from typing import List
 
-from networkcore import GameEvent, NetworkHost, PlayerInput
+from networkcore import GameEvent, NetworkHost, PlayerInput, Server
 
 EVENT_TYPE_GOAL = 1
+
+# Roles de taca-taca — opacos para el core, definidos y usados solo acá
+# (mismo diseño que go/ejemplo-tacataca/main.go). ROLE_BOARD es el tablero
+# (recibe el mismo snapshot que todos, pero no controla ninguna barra);
+# ROLE_PADDLE es un mando/jugador.
+ROLE_BOARD = 0x01
+ROLE_PADDLE = 0x02
+
+# MAX_PADDLES: cupo de mandos por partida — regla de taca-taca, no del core
+# (Server.max_players_per_room es un tope numérico genérico que no
+# distingue roles; este chequeo sí lo hace).
+MAX_PADDLES = 2
 
 
 @dataclass
@@ -69,8 +83,17 @@ class TacaTacaGame:
         host.on_input = lambda input: self._on_input(host, input)
         host.state_provider = self._encode_state
 
-    def _on_connected(self, player_id: int):
+    def _on_connected(self, player_id: int, role: int):
+        # role es opaco para el core: acá es donde taca-taca decide qué
+        # hacer con cada valor. El tablero (ROLE_BOARD) recibe el mismo
+        # snapshot que todos (ve la partida completa) pero no controla
+        # ninguna barra. Un mando (ROLE_PADDLE) más allá del cupo tampoco
+        # recibe barra — se queda conectado, pero sin efecto en el juego.
+        if role != ROLE_PADDLE:
+            return
         with self._lock:
+            if len(self.state.rods) >= MAX_PADDLES:
+                return
             self.state.rods.append(RodState(player_id=player_id))
 
     def _on_disconnected(self, player_id: int):
@@ -100,15 +123,27 @@ class TacaTacaGame:
 
 
 def main():
-    host = NetworkHost()
-    game = TacaTacaGame()
-    game.attach_to(host)
-    host.start(9999)
+    # room_factory: se llama una vez por sala creada (HANDSHAKE_MODE_CREATE)
+    # — cada partida de taca-taca es independiente, con su propio estado
+    # (pelota, score, barras). El Server no sabe nada de esto: solo llama a
+    # la factory y le rutea paquetes a lo que devuelve.
+    def room_factory() -> NetworkHost:
+        host = NetworkHost()
+        game = TacaTacaGame()
+        game.attach_to(host)
+        return host
+
+    # max_players_per_room es el tope genérico del Server (cuenta clientes,
+    # sin distinguir roles) — para taca-taca da igual a MAX_PADDLES+1
+    # (tablero). El cupo específico por rol (2 barras exactas) lo aplica
+    # TacaTacaGame._on_connected arriba.
+    server = Server(room_factory, max_players_per_room=MAX_PADDLES + 1)
+    server.start_udp(9999)
 
     try:
         threading.Event().wait()
     except KeyboardInterrupt:
-        host.stop()
+        server.stop()
 
 
 if __name__ == "__main__":
