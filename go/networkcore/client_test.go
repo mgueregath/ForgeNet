@@ -149,3 +149,71 @@ func TestNetworkClientAutoAcksReliableEvent(t *testing.T) {
 	}
 	t.Fatal("el cliente no ackeó el evento reliable (la cola de retransmisión no se vació)")
 }
+
+// TestEmbeddedHostMode prueba el modo "host embebido" (ej. un tablero LAN
+// que corre el Server él mismo): la sala existe de entrada, vía
+// Server.CreateRoom() — sin ningún cliente todavía — y los mandos se unen
+// después con JoinRoom, exactamente igual que en el modo "server online"
+// (TestNetworkClientCreateAndJoinRoom, donde es un CLIENTE el que crea la
+// sala por handshake de red). Mismo Server, mismo NetworkClient, misma
+// sala — la única diferencia es quién la creó y cómo.
+func TestEmbeddedHostMode(t *testing.T) {
+	fakeState := []byte{9, 9, 9}
+	factory := func() *NetworkHost {
+		h := NewNetworkHost()
+		h.StateProvider = func() []byte { return fakeState }
+		return h
+	}
+	server := NewServer(factory, ServerOptions{})
+	if err := server.StartUDP(29985); err != nil {
+		t.Fatal(err)
+	}
+	defer server.Stop()
+
+	roomCode := server.CreateRoom()
+	if roomCode == "" {
+		t.Fatal("CreateRoom() no devolvió código de sala")
+	}
+	time.Sleep(200 * time.Millisecond)
+
+	mando := NewNetworkClient()
+	if err := mando.JoinRoom("127.0.0.1", 29985, 1, roomCode, 2*time.Second); err != nil {
+		t.Fatalf("JoinRoom contra la sala pre-creada: %v", err)
+	}
+	defer mando.Disconnect()
+	if mando.PlayerID == 0 {
+		t.Fatal("PlayerID no asignado")
+	}
+	if mando.RoomCode != roomCode {
+		t.Fatalf("el mando terminó en otra sala: %q vs %q", mando.RoomCode, roomCode)
+	}
+}
+
+// TestEmbeddedHostRoomSurvivesEmptyGracePeriod: una sala pre-creada (modo
+// host embebido) que todavía no admitió a NADIE no debe destruirse nunca
+// por el janitor, sin importar cuánto tiempo pase — el tablero puede
+// quedarse esperando en el lobby indefinidamente. Solo empieza a correr el
+// EmptyRoomGracePeriod una vez que la sala tuvo al menos un cliente (ver
+// hadPlayer en server.go).
+func TestEmbeddedHostRoomSurvivesEmptyGracePeriod(t *testing.T) {
+	server := NewServer(func() *NetworkHost { return NewNetworkHost() }, ServerOptions{
+		EmptyRoomGracePeriod: 300 * time.Millisecond,
+	})
+	if err := server.StartUDP(29984); err != nil {
+		t.Fatal(err)
+	}
+	defer server.Stop()
+
+	roomCode := server.CreateRoom()
+
+	// Esperar bastante más que el (muy corto, a propósito) grace period —
+	// si la sala vacía-sin-nadie-nunca fuera tratada igual que una vacía-
+	// tras-tener-gente, el janitor ya la habría destruido acá.
+	time.Sleep(1 * time.Second)
+
+	client := NewNetworkClient()
+	if err := client.JoinRoom("127.0.0.1", 29984, 1, roomCode, 2*time.Second); err != nil {
+		t.Fatalf("la sala pre-creada no sobrevivió la espera: %v", err)
+	}
+	defer client.Disconnect()
+}

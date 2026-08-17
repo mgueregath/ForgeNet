@@ -20,7 +20,12 @@ Every language folder ships a `networkcore` library plus a small `tacataca` exam
 
 `go/networkcore` additionally accepts **two transports at once** — raw UDP and WebTransport/QUIC — so a browser tab and a native (Unity) client can be in the same match, talking to the same host, without the core caring which is which.
 
-`go/networkcore` also multiplexes many concurrent matches over one running server (`Server`, in `server.go`): a client's handshake either creates a new room (server generates and returns a short join code) or joins an existing one by that code, and everything after the handshake — input, ack, ping — gets routed to the right room automatically. This is what lets one deployed process host many simultaneous online games instead of one process per match; the join code is plain data (a short string), so turning it into a QR code, a deep link, or a typed-in code is entirely up to whatever renders it client-side.
+`go/networkcore` also multiplexes many concurrent matches over one running server (`Server`, in `server.go`), in either of two ways — both produce the exact same kind of room, joined the exact same way, so a game can pick per-deployment, not per-protocol:
+
+- **Client-created (online mode)**: a client's handshake creates a new room (server generates and returns a short join code) or joins an existing one by that code. This is what an always-on public `Server` uses — one deployed process hosting many simultaneous matches, none of them pre-existing until a client asks for one. The join code is plain data (a short string), so turning it into a QR code, a deep link, or a typed-in code is entirely up to whatever renders it client-side.
+- **Host-created (embedded/LAN mode)**: `Server.CreateRoom()` makes a room directly, with no client and no network round trip — for an app that *is* the host (e.g. a board on the local network) and wants one fixed room from the moment it starts, instead of waiting for someone to "create" it. A room made this way is immune to the empty-room janitor until it admits its first real client, so it can sit open in a lobby indefinitely.
+
+Everything downstream — `JoinRoom`, input, snapshots, reconnection — works identically regardless of which path created the room.
 
 `go/networkcore` also has a `NetworkClient` (in `client.go`) — Go isn't server-only anymore. Any Go process can `CreateRoom`/`JoinRoom` against a `Server` (this one or another language's), not just host one, which matters for an app that needs to be either side (e.g. embed a `Server` for local/offline play, or connect out as a `NetworkClient` to a deployed one for online play, picking at runtime).
 

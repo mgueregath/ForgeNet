@@ -134,6 +134,22 @@ func (s *Server) Stop() {
 	}
 }
 
+// CreateRoom arranca una sala directamente, sin pasar por un handshake de
+// red — a diferencia de una sala creada porque un cliente mandó
+// HandshakeModeCreate, acá no hay ningún cliente admitido todavía.
+//
+// Pensado para el modo "host embebido" (ej. un tablero en LAN, que es el
+// mismo proceso que corre el Server): la app llama a esto una vez al
+// arrancar y ya tiene una sala fija a la que los mandos se unen con
+// JoinRoom, sin que el propio tablero tenga que hacerse pasar por cliente
+// de sí mismo para "crear" la sala. La sala recién creada NO cuenta como
+// "vacía" para el janitor (ver sweepEmptyRooms/hadPlayer) hasta que admite
+// a su primer cliente de verdad, así que puede esperar indefinidamente a
+// que alguien se una sin que EmptyRoomGracePeriod la destruya.
+func (s *Server) CreateRoom() string {
+	return s.createRoom().code
+}
+
 // registerCloser: cada transporte (StartUDP, StartWebTransport) registra
 // acá cómo cerrarse, para que Stop() pueda desbloquear sus loops de
 // recepción.
