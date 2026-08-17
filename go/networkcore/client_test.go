@@ -1,6 +1,7 @@
 package networkcore
 
 import (
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -216,4 +217,37 @@ func TestEmbeddedHostRoomSurvivesEmptyGracePeriod(t *testing.T) {
 		t.Fatalf("la sala pre-creada no sobrevivió la espera: %v", err)
 	}
 	defer client.Disconnect()
+}
+
+// TestCreateRoomWithCode: variante de TestEmbeddedHostMode con un código
+// elegido por el caller en vez de uno random — el caso "host embebido, una
+// sola sala fija por proceso" (ver el comentario grande de
+// CreateRoomWithCode en server.go).
+func TestCreateRoomWithCode(t *testing.T) {
+	server := NewServer(func() *NetworkHost { return NewNetworkHost() }, ServerOptions{})
+	if err := server.StartUDP(29983); err != nil {
+		t.Fatal(err)
+	}
+	defer server.Stop()
+
+	code, err := server.CreateRoomWithCode("MESA01")
+	if err != nil {
+		t.Fatalf("CreateRoomWithCode: %v", err)
+	}
+	if code != "MESA01" {
+		t.Fatalf("código devuelto no coincide: %q", code)
+	}
+
+	mando := NewNetworkClient()
+	if err := mando.JoinRoom("127.0.0.1", 29983, 1, "MESA01", 2*time.Second); err != nil {
+		t.Fatalf("JoinRoom contra la sala de código fijo: %v", err)
+	}
+	defer mando.Disconnect()
+
+	if _, err := server.CreateRoomWithCode("MESA01"); !errors.Is(err, ErrRoomCodeTaken) {
+		t.Fatalf("esperaba ErrRoomCodeTaken creando un código repetido, recibí: %v", err)
+	}
+	if _, err := server.CreateRoomWithCode(""); !errors.Is(err, ErrRoomCodeEmpty) {
+		t.Fatalf("esperaba ErrRoomCodeEmpty con código vacío, recibí: %v", err)
+	}
 }

@@ -2,6 +2,7 @@ package networkcore
 
 import (
 	"crypto/rand"
+	"errors"
 	"sync"
 	"time"
 )
@@ -147,7 +148,38 @@ func (s *Server) Stop() {
 // a su primer cliente de verdad, así que puede esperar indefinidamente a
 // que alguien se una sin que EmptyRoomGracePeriod la destruya.
 func (s *Server) CreateRoom() string {
-	return s.createRoom().code
+	return s.createRoom(s.generateUniqueRoomCode()).code
+}
+
+// ErrRoomCodeTaken: CreateRoomWithCode lo devuelve si code ya está en uso.
+var ErrRoomCodeTaken = errors.New("networkcore: código de sala en uso")
+
+// ErrRoomCodeEmpty: CreateRoomWithCode lo devuelve si code es "".
+var ErrRoomCodeEmpty = errors.New("networkcore: código de sala vacío")
+
+// CreateRoomWithCode es CreateRoom pero con un código elegido por el
+// caller en vez de uno random — útil para el caso "host embebido, una sola
+// sala por proceso" (ver el comentario grande de CreateRoom): sin esto,
+// cada arranque tiene un código distinto y cualquier conexión manual
+// (tipeando IP/puerto en vez de escanear un QR) necesita que el operador
+// lea y transcriba ese código cada vez. Con un código fijo conocido de
+// antemano, la conexión manual puede pedir solo IP y puerto. code no
+// puede superar 255 bytes (RoomCodeLen es un solo byte en el wire format,
+// ver EncodeJoinPayload/encodeHandshakeAck en protocol.go).
+func (s *Server) CreateRoomWithCode(code string) (string, error) {
+	if code == "" {
+		return "", ErrRoomCodeEmpty
+	}
+	if len(code) > 255 {
+		return "", errors.New("networkcore: código de sala demasiado largo (máx 255 bytes)")
+	}
+	s.mu.RLock()
+	_, exists := s.rooms[code]
+	s.mu.RUnlock()
+	if exists {
+		return "", ErrRoomCodeTaken
+	}
+	return s.createRoom(code).code, nil
 }
 
 // registerCloser: cada transporte (StartUDP, StartWebTransport) registra
@@ -212,7 +244,7 @@ func (s *Server) handleHandshake(seq uint32, peer Peer, payload []byte) {
 	var r *room
 	switch mode {
 	case HandshakeModeCreate:
-		r = s.createRoom()
+		r = s.createRoom(s.generateUniqueRoomCode())
 	case HandshakeModeJoin:
 		s.mu.RLock()
 		r = s.rooms[roomCode]
@@ -272,8 +304,7 @@ func (s *Server) sweepHandshakeAttempts() {
 	}
 }
 
-func (s *Server) createRoom() *room {
-	code := s.generateUniqueRoomCode()
+func (s *Server) createRoom(code string) *room {
 	host := s.roomFactory()
 	host.start()
 
