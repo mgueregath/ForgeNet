@@ -20,9 +20,15 @@ const (
 // cosa que pueda mandar bytes y tenga una clave estable sirve. Esto es lo
 // que permite que clientes Unity (UDP) y clientes de navegador
 // (WebTransport) jueguen en la misma partida, contra el mismo NetworkHost.
+//
+// IP(): el protocolo no lleva ningún token de sesión, así que AdmitPlayer
+// usa la IP (sin el puerto, que cambia en cada reconexión — nuevo socket
+// UDP o nueva sesión QUIC) como heurística para reconocer "es el mismo
+// dispositivo reconectándose" — ver el comentario grande ahí.
 type Peer interface {
 	Send(data []byte)
 	Key() string
+	IP() string
 }
 
 // ClientConnection: estado de sesión de un cliente. No tiene ningún campo
@@ -72,7 +78,10 @@ type NetworkHost struct {
 	loopsOnce  sync.Once
 
 	// --- Hooks genéricos: acá es donde el juego se engancha ---
-	OnPlayerConnected    func(playerID uint16, role uint8)
+	// OnPlayerConnected: reconnected=true si esto fue una reconexión
+	// reconocida por IP (ver AdmitPlayer) — el juego puede usarlo para NO
+	// pisar el estado que ya tenía ese jugador con uno vacío.
+	OnPlayerConnected    func(playerID uint16, role uint8, reconnected bool)
 	OnPlayerDisconnected func(playerID uint16)
 	OnInput              func(input PlayerInput)
 	OnTick               func(tick uint64)
@@ -175,10 +184,20 @@ func (h *NetworkHost) PendingReliableCount(playerID uint16) int {
 	return len(client.ReliableQueue)
 }
 
+// ConnectedPlayerCount solo cuenta Connected==true — h.clients también
+// incluye clientes desconectados que quedaron "reclamables" para una
+// reconexión (ver heartbeatLoop/AdmitPlayer), así que len(h.clients) ya no
+// alcanza.
 func (h *NetworkHost) ConnectedPlayerCount() int {
 	h.clientsMux.RLock()
 	defer h.clientsMux.RUnlock()
-	return len(h.clients)
+	n := 0
+	for _, c := range h.clients {
+		if c.Connected {
+			n++
+		}
+	}
+	return n
 }
 
 // --- Recepción: punto de entrada común para cualquier transporte ---
@@ -203,41 +222,74 @@ func (h *NetworkHost) HandlePacket(data []byte, peer Peer) {
 	}
 }
 
-// AdmitPlayer registra un cliente nuevo en esta sala y dispara
-// OnPlayerConnected(playerID, role). La llama Server, después de decidir
-// (crear/unirse) a qué sala pertenece el cliente. Role es opaco para el
-// core — cada juego define sus propios valores y qué hacer con ellos (ej.
-// no crear una "barra" de juego para el rol que representa al tablero).
-// Idempotente: un cliente que ya está admitido devuelve su PlayerID actual
-// sin duplicar estado (cubre el reintento de un handshake cuyo ack se
-// perdió).
-func (h *NetworkHost) AdmitPlayer(peer Peer, role uint8) uint16 {
+// AdmitPlayer registra un cliente nuevo en esta sala, o reconoce una
+// reconexión, y dispara OnPlayerConnected(playerID, role, reconnected). La
+// llama Server, después de decidir (crear/unirse) a qué sala pertenece el
+// cliente. Role es opaco para el core — cada juego define sus propios
+// valores y qué hacer con ellos (ej. no crear una "barra" de juego para el
+// rol que representa al tablero).
+//
+// Reconexión: si hay un cliente marcado desconectado (ver heartbeatLoop)
+// con la misma IP (Peer.IP()) que quien está haciendo el handshake, se le
+// devuelve la MISMA identidad (PlayerID, y el Role ORIGINAL — no el que
+// venga en este handshake, para no perder de vista quién era) en vez de
+// crear un jugador nuevo. Es una heurística por IP, no un token de sesión
+// (el protocolo no lleva uno todavía): funciona bien en la LAN/datos
+// móviles típica, donde cada dispositivo tiene su propia IP — no es a
+// prueba de balas si dos jugadores comparten la misma IP pública (NAT
+// compartido) y ambos están desconectados a la vez.
+//
+// Idempotente además en el sentido de siempre: un cliente que ya está
+// admitido (mismo Peer.Key(), sin pasar por desconexión) devuelve su
+// PlayerID actual sin duplicar estado ni disparar el hook de nuevo (cubre
+// el reintento de un handshake cuyo ack se perdió).
+func (h *NetworkHost) AdmitPlayer(peer Peer, role uint8) (playerID uint16, reconnected bool) {
 	key := peer.Key()
 
 	h.clientsMux.Lock()
 	if existing, exists := h.clientsByKey[key]; exists {
 		h.clientsMux.Unlock()
-		return existing.PlayerID
+		return existing.PlayerID, false
 	}
 
-	playerID := h.nextPlayerID
-	h.nextPlayerID++
-
-	client := &ClientConnection{
-		PlayerID:      playerID,
-		Peer:          peer,
-		Role:          role,
-		LastHeartbeat: time.Now(),
-		Connected:     true,
+	var reclaimed *ClientConnection
+	if ip := peer.IP(); ip != "" {
+		for _, c := range h.clients {
+			if !c.Connected && c.Peer.IP() == ip {
+				reclaimed = c
+				break
+			}
+		}
 	}
-	h.clients[playerID] = client
-	h.clientsByKey[key] = client
+
+	if reclaimed != nil {
+		delete(h.clientsByKey, reclaimed.Peer.Key())
+		reclaimed.Peer = peer
+		reclaimed.Connected = true
+		reclaimed.LastHeartbeat = time.Now()
+		h.clientsByKey[key] = reclaimed
+		playerID = reclaimed.PlayerID
+		role = reclaimed.Role
+		reconnected = true
+	} else {
+		playerID = h.nextPlayerID
+		h.nextPlayerID++
+		client := &ClientConnection{
+			PlayerID:      playerID,
+			Peer:          peer,
+			Role:          role,
+			LastHeartbeat: time.Now(),
+			Connected:     true,
+		}
+		h.clients[playerID] = client
+		h.clientsByKey[key] = client
+	}
 	h.clientsMux.Unlock()
 
 	if h.OnPlayerConnected != nil {
-		h.OnPlayerConnected(playerID, role)
+		h.OnPlayerConnected(playerID, role, reconnected)
 	}
-	return playerID
+	return playerID, reconnected
 }
 
 // GetClientRole devuelve el rol opaco con el que se admitió a un jugador
@@ -462,10 +514,17 @@ func (h *NetworkHost) heartbeatLoop() {
 				toRemove = append(toRemove, id)
 			}
 		}
+		// Solo se marca Connected=false — a propósito NO se borra de
+		// h.clients: se mantiene "reclamable" por AdmitPlayer si el mismo
+		// dispositivo (misma IP) vuelve a conectarse, así el juego puede
+		// restaurar su estado en vez de tratarlo como uno nuevo.
+		// clientsByKey sí se limpia: esa key (ej. ip:puerto UDP viejo) ya
+		// no sirve para rutear nada. El Server, por su lado, no destruye
+		// esta sala instantáneamente al quedar en 0 conectados — ver
+		// ServerOptions.EmptyRoomGracePeriod.
 		for _, id := range toRemove {
 			client := h.clients[id]
 			client.Connected = false
-			delete(h.clients, id)
 			delete(h.clientsByKey, client.Peer.Key())
 		}
 		h.clientsMux.Unlock()

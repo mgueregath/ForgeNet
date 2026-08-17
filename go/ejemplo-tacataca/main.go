@@ -91,7 +91,14 @@ func (s *tacaTacaState) attachTo(host *networkcore.NetworkHost) {
 	// mando (rolePaddle) más allá del cupo tampoco recibe barra — se queda
 	// conectado, pero sin efecto en el juego (rechazarlo requeriría que el
 	// core soporte desconexión post-admisión, que hoy no tiene).
-	host.OnPlayerConnected = func(id uint16, role uint8) {
+	//
+	// reconnected (reconexión reconocida por IP, ver AdmitPlayer) no se usa
+	// acá: este ejemplo no conserva posición/rotación entre reconexiones —
+	// OnPlayerDisconnected ya borra la barra, así que reconectar arma una
+	// nueva desde cero. Un juego real que quiera conservar estado (como
+	// hace netservice.go en el POC de taca-taca) chequearía este flag para
+	// NO pisar el estado existente.
+	host.OnPlayerConnected = func(id uint16, role uint8, reconnected bool) {
 		if role != rolePaddle {
 			return
 		}

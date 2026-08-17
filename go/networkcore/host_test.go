@@ -405,7 +405,7 @@ func TestRoleIsOpaqueButExposed(t *testing.T) {
 
 	var mu sync.Mutex
 	gotRoles := map[uint16]uint8{}
-	host.OnPlayerConnected = func(playerID uint16, role uint8) {
+	host.OnPlayerConnected = func(playerID uint16, role uint8, reconnected bool) {
 		mu.Lock()
 		defer mu.Unlock()
 		gotRoles[playerID] = role
@@ -489,4 +489,85 @@ func TestQueueReliableEventRetransmitsUntilAcked(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatal("la cola de retransmisión no se vació después del ack")
+}
+
+// TestReconnectionByIPPreservesIdentity: un cliente que se cae (deja de
+// mandar heartbeat) y vuelve a conectarse desde la misma IP a la misma sala
+// recibe el mismo PlayerID y el Role ORIGINAL — no el nuevo que mande en el
+// segundo handshake — ver el comentario grande en AdmitPlayer.
+func TestReconnectionByIPPreservesIdentity(t *testing.T) {
+	if testing.Short() {
+		t.Skip("test largo (10s+), se salta con -short")
+	}
+
+	host := NewNetworkHost()
+
+	var mu sync.Mutex
+	var playerIDs []uint16
+	var reconnectedFlags []bool
+	host.OnPlayerConnected = func(playerID uint16, role uint8, reconnected bool) {
+		mu.Lock()
+		defer mu.Unlock()
+		playerIDs = append(playerIDs, playerID)
+		reconnectedFlags = append(reconnectedFlags, reconnected)
+	}
+
+	server := NewServer(func() *NetworkHost { return host }, ServerOptions{})
+	if err := server.StartUDP(29992); err != nil {
+		t.Fatal(err)
+	}
+	defer server.Stop()
+	time.Sleep(200 * time.Millisecond)
+
+	first := newTestClient(t, 29992)
+	first.handshake(t, 7)
+	firstID := first.playerID
+	roomCode := first.roomCode
+	first.conn.Close() // simula la caída: deja de mandar heartbeat
+
+	time.Sleep(heartbeatTimeout + 500*time.Millisecond)
+
+	second := newTestClient(t, 29992)
+	second.join(t, 3, roomCode) // role distinto a propósito: debe ignorarse
+
+	if second.playerID != firstID {
+		t.Fatalf("reconexión no preservó el PlayerID: got %d, want %d", second.playerID, firstID)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(reconnectedFlags) != 2 {
+		t.Fatalf("esperaba 2 llamadas a OnPlayerConnected, hubo %d", len(reconnectedFlags))
+	}
+	if reconnectedFlags[0] {
+		t.Error("la primera conexión no debería marcarse reconnected")
+	}
+	if !reconnectedFlags[1] {
+		t.Error("la segunda conexión debería reconocerse como reconnected")
+	}
+	if role, ok := host.GetClientRole(firstID); !ok || role != 7 {
+		t.Errorf("Role tras reconexión = %d, ok=%v — quería el original (7), no el de la reconexión (3)", role, ok)
+	}
+}
+
+// TestUDPPortEphemeral: pedir el puerto 0 le deja al SO elegir uno libre, y
+// UDPPort() debe devolver cuál asignó de verdad (no 0) — hace falta para un
+// deployment que no quiere depender de que un puerto fijo esté siempre
+// libre.
+func TestUDPPortEphemeral(t *testing.T) {
+	server := NewServer(func() *NetworkHost { return NewNetworkHost() }, ServerOptions{})
+	if err := server.StartUDP(0); err != nil {
+		t.Fatal(err)
+	}
+	defer server.Stop()
+
+	if server.UDPPort() == 0 {
+		t.Fatal("UDPPort() debería devolver el puerto real asignado por el SO, no 0")
+	}
+
+	client := newTestClient(t, int(server.UDPPort()))
+	client.handshake(t, 1)
+	if client.playerID == 0 {
+		t.Fatal("handshake contra el puerto efímero falló")
+	}
 }

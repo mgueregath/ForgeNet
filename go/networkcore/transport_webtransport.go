@@ -37,6 +37,14 @@ func (p *wtPeer) Key() string {
 	return p.key
 }
 
+func (p *wtPeer) IP() string {
+	host, _, err := net.SplitHostPort(p.sess.RemoteAddr().String())
+	if err != nil {
+		return p.sess.RemoteAddr().String()
+	}
+	return host
+}
+
 // WebTransportOptions configura el listener WebTransport.
 type WebTransportOptions struct {
 	// Addr, ej. ":9443". El navegador se conecta a wss/https en ese puerto.

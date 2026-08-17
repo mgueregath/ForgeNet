@@ -103,3 +103,17 @@ func encodeHandshakeAck(playerID uint16, roomCode string) []byte {
 	buf = append(buf, roomCode...)
 	return buf
 }
+
+// decodeHandshakeAck: lado cliente de encodeHandshakeAck — ver NetworkClient
+// en client.go.
+func decodeHandshakeAck(payload []byte) (playerID uint16, roomCode string, ok bool) {
+	if len(payload) < 3 {
+		return 0, "", false
+	}
+	playerID = uint16(payload[0])<<8 | uint16(payload[1])
+	codeLen := int(payload[2])
+	if len(payload) < 3+codeLen {
+		return 0, "", false
+	}
+	return playerID, string(payload[3 : 3+codeLen]), true
+}

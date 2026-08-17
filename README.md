@@ -22,6 +22,10 @@ Every language folder ships a `networkcore` library plus a small `tacataca` exam
 
 `go/networkcore` also multiplexes many concurrent matches over one running server (`Server`, in `server.go`): a client's handshake either creates a new room (server generates and returns a short join code) or joins an existing one by that code, and everything after the handshake — input, ack, ping — gets routed to the right room automatically. This is what lets one deployed process host many simultaneous online games instead of one process per match; the join code is plain data (a short string), so turning it into a QR code, a deep link, or a typed-in code is entirely up to whatever renders it client-side.
 
+`go/networkcore` also has a `NetworkClient` (in `client.go`) — Go isn't server-only anymore. Any Go process can `CreateRoom`/`JoinRoom` against a `Server` (this one or another language's), not just host one, which matters for an app that needs to be either side (e.g. embed a `Server` for local/offline play, or connect out as a `NetworkClient` to a deployed one for online play, picking at runtime).
+
+Reconnection is built into `Server`/`NetworkHost`: if a client's connection drops (missed heartbeats) and a new handshake arrives from the same IP into the same room before `ServerOptions.EmptyRoomGracePeriod` elapses, it's treated as the same player — same `PlayerID`, same original `Role` — instead of a stranger joining fresh (`OnPlayerConnected`'s `reconnected` argument tells the game which case it is). This is an IP-based heuristic, not a session token (the protocol doesn't carry one yet), so it's not airtight against two devices sharing one public IP (NAT) both dropping at once — good enough for typical home/mobile-data networks, not a substitute for real session auth on a fully public deployment.
+
 ## Why this exists
 
 Most open-source netcode libraries commit early to one engine and one language (Mirror and FishNet to Unity/C#, Netcode for GameObjects the same, ENet to a C ABI you bind per-engine). ForgeNet inverts that: the protocol and the state machine are specified once, then implemented natively per language/runtime, so integrating it into a new engine is "write a thin binding," not "port a library."
@@ -43,11 +47,13 @@ Most open-source netcode libraries commit early to one engine and one language (
 ## Repository layout
 
 ```
-go/           server — Go is the reference implementation for the classic
-              Dedicated Server topology. Accepts UDP and WebTransport at
-              once, in the same match.
+go/           server + client — Go is the reference implementation for the
+              classic Dedicated Server topology. Accepts UDP and
+              WebTransport at once, in the same match; NetworkClient lets
+              any Go process connect out to a Server too (this one or
+              another language's).
 rust/         server
-python/       server + client — the only language with both roles
+python/       server + client — the only other language with both roles
 cpp/          server, header-only, C++17, no external dependencies
 typescript/   client (Node.js, via dgram)
 csharp/       server (embedded host) + client — the real base for Unity
@@ -100,7 +106,7 @@ Full per-language detail (test counts, design notes, known caveats) lives inline
 | `ALLOWED_ORIGINS` | unset (any) | Comma-separated origins allowed to open a WebTransport session. Leaving this unset accepts any origin, which is fine for local dev but means any web page could open a session against a public deployment |
 | `MAX_PLAYERS_PER_ROOM` | `3` (taca-taca specific: 2 paddles + 1 board) | Generic numeric cap per room, enforced by `Server` regardless of role |
 
-Also built in: a handshake rate limit per `Peer` (`ServerOptions.HandshakeRateLimit`, default 10 attempts/10s — throttles a broken/looping client or a simple single-source flood, not a distributed one), and `QueueReliableEvent` for game events that must survive real packet loss (retransmitted via the same reliable-delivery machinery used for input, until the client ACKs).
+Also built in: a handshake rate limit per `Peer` (`ServerOptions.HandshakeRateLimit`, default 10 attempts/10s — throttles a broken/looping client or a simple single-source flood, not a distributed one); `QueueReliableEvent` for game events that must survive real packet loss (retransmitted via the same reliable-delivery machinery used for input, until the client ACKs — Go's own `NetworkClient` handles this ACK automatically); and `ServerOptions.EmptyRoomGracePeriod` (default 30s) — a room that had players but is momentarily at zero doesn't get torn down instantly, so a dropped connection has a real window to reconnect (see IP-based reconnection above) before its room disappears.
 
 The process handles `SIGTERM`/`SIGINT` by draining (`Server.Stop()`, which stops every room's loops and closes the transports) before exiting — needed for `docker stop` or a rolling redeploy to not just kill active matches outright.
 
@@ -114,7 +120,7 @@ docker run --rm -p 9999:9999/udp -p 9443:9443/udp -p 8080:8080/tcp forgenet-taca
 The near-term goal is packaging this as an embeddable library per engine rather than a standalone example:
 
 1. **Unity**: a thin `MonoBehaviour` wrapper around `csharp/NetworkCore`'s embedded host, for offline/LAN play — instantiate a real server inside the app when a player hosts a match, and a matching client-only mode ("controller" role) that never renders the authoritative state.
-2. **Online play**: a `NetworkClient` mode that connects to a standalone `go/networkcore` `Server` deployment instead of an embedded host — for taca-taca specifically, the board becomes a client like any paddle controller (just a different `role` value), creates a room on start, and turns the returned join code into a QR for the paddles to scan. `Server` itself is now hardened for this (see above); still missing before real public exposure: per-session auth tokens (raw UDP still has none — a client's identity is its transport address, which can be spoofed), and reconnection by session token rather than by transport address (a brief network drop today means rejoining as a stranger, losing your room-role assignment).
+2. **Online play**: a `NetworkClient` mode that connects to a standalone `go/networkcore` `Server` deployment instead of an embedded host — for taca-taca specifically, the board becomes a client like any paddle controller (just a different `role` value), creates a room on start, and turns the returned join code into a QR for the paddles to scan. `Server` itself is now hardened for this (see above) and Go now has a real `NetworkClient` to do this from; reconnection by IP is also built in now (see above). Still missing before real public exposure: per-session auth tokens (raw UDP still has none — a client's identity is its transport address, which can be spoofed; the IP-based reconnection heuristic isn't a substitute for real session auth either).
 3. **Role selection + LAN discovery** at app startup — mDNS/Bonjour/NSD from day one (confirmed necessary for iOS; raw UDP broadcast doesn't reach it).
 4. **Godot / Unreal bindings** built the same way: thin native bindings over the existing `cpp/` or language-native cores, no protocol changes required.
 

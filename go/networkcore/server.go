@@ -30,12 +30,22 @@ type ServerOptions struct {
 	// desde una única conexión.
 	HandshakeRateLimit       int
 	HandshakeRateLimitWindow time.Duration
+	// EmptyRoomGracePeriod: cuánto se espera, desde que una sala que ya
+	// tuvo jugadores queda en 0 conectados, antes de destruirla — no
+	// instantáneo, para darle tiempo a AdmitPlayer de reconocer una
+	// reconexión (ver el comentario grande ahí) antes de que la sala misma
+	// deje de existir. Default: 30s.
+	EmptyRoomGracePeriod time.Duration
 }
 
 type room struct {
 	code      string
 	host      *NetworkHost
 	hadPlayer bool
+	// emptySince: desde cuándo ConnectedPlayerCount() está en 0 — tiempo
+	// cero mientras la sala tiene al menos un cliente conectado. Ver
+	// sweepEmptyRooms.
+	emptySince time.Time
 }
 
 // peerInfo recuerda a qué sala pertenece cada Peer y guarda el último ack
@@ -66,6 +76,8 @@ type Server struct {
 	closers    []func()
 	closersMux sync.Mutex
 	done       chan struct{}
+
+	udpPort uint16
 }
 
 type handshakeWindow struct {
@@ -84,6 +96,9 @@ func NewServer(factory RoomFactory, opts ServerOptions) *Server {
 	}
 	if opts.HandshakeRateLimitWindow <= 0 {
 		opts.HandshakeRateLimitWindow = 10 * time.Second
+	}
+	if opts.EmptyRoomGracePeriod <= 0 {
+		opts.EmptyRoomGracePeriod = 30 * time.Second
 	}
 	s := &Server{
 		opts:              opts,
@@ -199,7 +214,7 @@ func (s *Server) handleHandshake(seq uint32, peer Peer, payload []byte) {
 		return
 	}
 
-	playerID := r.host.AdmitPlayer(peer, role)
+	playerID, _ := r.host.AdmitPlayer(peer, role)
 	r.hadPlayer = true
 
 	ack := append(buildHeader(seq, 0, PacketHandshake, 0), encodeHandshakeAck(playerID, r.code)...)
@@ -280,8 +295,9 @@ func randomRoomCode(length int) string {
 }
 
 // janitorLoop destruye salas que se quedaron sin ningún cliente conectado
-// — genérico, no sabe qué juego corre en ellas. Una sala recién creada que
-// todavía no tuvo ningún cliente no se toca (hadPlayer).
+// durante más de EmptyRoomGracePeriod — genérico, no sabe qué juego corre
+// en ellas. Una sala recién creada que todavía no tuvo ningún cliente no se
+// toca (hadPlayer).
 func (s *Server) janitorLoop() {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
@@ -299,10 +315,23 @@ func (s *Server) janitorLoop() {
 func (s *Server) sweepEmptyRooms() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	now := time.Now()
 	for code, r := range s.rooms {
-		if !r.hadPlayer || r.host.ConnectedPlayerCount() > 0 {
+		if !r.hadPlayer {
 			continue
 		}
+		if r.host.ConnectedPlayerCount() > 0 {
+			r.emptySince = time.Time{}
+			continue
+		}
+		if r.emptySince.IsZero() {
+			r.emptySince = now
+			continue
+		}
+		if now.Sub(r.emptySince) < s.opts.EmptyRoomGracePeriod {
+			continue
+		}
+
 		r.host.Stop()
 		delete(s.rooms, code)
 		for peerKey, info := range s.peers {
