@@ -1,64 +1,246 @@
 # ForgeNet
 
-A generic multiplayer networking core, implemented from scratch **in 6 languages** (Go, Rust, Python, C++, TypeScript, C#), sharing the same wire protocol and the same design principle: **the transport layer knows nothing about the game running on top of it.**
+A generic multiplayer networking core, implemented from scratch **in 6 languages** (Go, Rust, Python, C++, TypeScript, C#), sharing one wire protocol and one design principle: **the transport layer knows nothing about the game running on top of it.**
 
-Handshake, heartbeat, input, snapshots, reliable delivery and ping are handled by the core. Game state travels as an opaque `StatePayload` — bytes the core moves but never interprets — and the game plugs in through four hooks, plus one opaque field:
+Handshake, heartbeat, input transport, snapshots, reliable delivery, reconnection, room/session management and ping are all handled by the core. Your game's state, your game's events, and what a "player role" means are all opaque to it — you supply those, the core just moves the bytes reliably. This document is for the second case: **you're building a game and want to use ForgeNet as its network layer.**
+
+If you want to understand or modify ForgeNet itself (protocol internals, architecture, roadmap), see [`docs/`](docs/) instead — this README only covers using it.
+
+## What ForgeNet gives you
+
+- A binary UDP (and, in Go, WebTransport/QUIC for browsers) transport with handshake, heartbeat-based disconnect detection, ordered/reliable delivery, and ping/RTT — so you don't write socket code.
+- **Rooms**: many concurrent matches multiplexed over one running server, joined by a short code — so "player creates a match, others join with a code" is built in, not something you build on top.
+- **Reconnection**: a dropped client that comes back is recognized and rejoins as the same player, not a stranger — built in, not something you build on top.
+- **Four hooks + a handful of opaque fields** where your game plugs in. The core never inspects game state, input meaning, event meaning, or role meaning — see [Design principle](#design-principle-the-core-never-interprets-your-game) below for why that's not just an implementation detail.
+
+## The two modes
+
+ForgeNet supports two topologies with **the same protocol, the same client code, and the same room mechanics** — you pick per deployment, not per protocol version:
+
+| | Embedded Host (LAN / offline) | Dedicated Server (online) |
+|---|---|---|
+| Who runs the server | One of the players' own devices (e.g. a "board" app) | A separate always-on process you deploy |
+| How the room is made | The host calls `Server.CreateRoom()` directly at startup — no network round trip, no client needed | A client's handshake creates it (`NetworkClient.CreateRoom`) — the server generates and returns the room code |
+| How others join | `NetworkClient.JoinRoom(host, port, role, code)` — `host` is the LAN device's local IP | Same call — `host` is the server's public IP/domain instead |
+| Internet required | No | Yes |
+| Typical use | Local party play, no backend to run | Play with people not on the same network |
+
+Both paths produce an identical room — same `NetworkHost` instance underneath, same hooks fire, same clients connect the same way. A game can support both by choosing at runtime which one it calls: `Server.CreateRoom()` if hosting locally, or connect out with `NetworkClient.CreateRoom(...)`/`JoinRoom(...)` against a deployed server if playing online. Nothing about your game logic needs to know which mode is active — the hooks and the wire format are identical either way.
 
 ```
-on_player_connected(player_id, role) / on_player_disconnected(player_id)
-                  — role is an opaque byte the core stores and forwards,
-                    never interprets: each game defines what its values
-                    mean (e.g. taca-taca uses one for "paddle", another
-                    for "board")
-on_input          — raw input per tick (delta_x/delta_y/rotation/actions)
-on_tick           — fired once per tick so the game can step its simulation
-state_provider    — the game hands back its current state bytes on each snapshot
-queue_event       — the game queues its own events (e.g. GOAL) with arbitrary type/data
+Embedded Host                         Dedicated Server
+┌─────────────────────┐               ┌─────────────────────┐
+│ Board app            │               │ Deployed process     │
+│  Server.CreateRoom() │               │  (game creates room  │
+│  → room exists, no   │               │   via a client's     │
+│    client needed     │               │   CreateRoom call)   │
+└──────────┬───────────┘               └──────────┬───────────┘
+           │ LAN                                    │ Internet
+   ┌───────┴───────┐                        ┌───────┴───────┐
+   │ NetworkClient │                        │ NetworkClient │
+   │ .JoinRoom(... │                        │ .JoinRoom(... │
+   │  LAN IP ...)  │                        │  public IP...)│
+   └───────────────┘                        └───────────────┘
 ```
 
-Every language folder ships a `networkcore` library plus a small `tacataca` example (a 2-paddle ball game) built **on top of** the core — proving the same core can host different games without being touched.
+## Design principle: the core never interprets your game
 
-`go/networkcore` additionally accepts **two transports at once** — raw UDP and WebTransport/QUIC — so a browser tab and a native (Unity) client can be in the same match, talking to the same host, without the core caring which is which.
+Every hook and payload the core exposes is **opaque** — it stores and forwards bytes/values without ever branching on what they mean. This isn't a style preference; it's what lets the exact same `networkcore` package run a paddle game, a shooter, or a board game without modification, and it's the rule any change to the core itself must preserve (see [`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md)). Concretely:
 
-`go/networkcore` also multiplexes many concurrent matches over one running server (`Server`, in `server.go`), in either of two ways — both produce the exact same kind of room, joined the exact same way, so a game can pick per-deployment, not per-protocol:
+- `StatePayload` (in every snapshot): raw bytes. The core moves them; only your `state_provider` hook writes them and your client-side decoder reads them.
+- `GameEvent.EventType` / `GameEvent.Data`: same deal — you define your own event type table (e.g. `1 = GOAL`, `2 = MATCH_START`) and payload format.
+- `Role` (a single opaque byte per connected player): you define what values mean for your game (e.g. `1 = paddle`, `2 = board`) and what to do when a given role connects. The core only ever stores it and hands it back to you.
+- `PlayerInput` (`DeltaX`, `DeltaY`, `Rotation`, `Actions`): a generic 2D-delta + rotation + 32-bit action bitmask. The core transports these numbers; what they mean is entirely up to you — see [Repurposing `PlayerInput`](#repurposing-playerinput-a-real-example) below for a real game that packs an entire lobby-selection UI into `Actions`, not just movement.
 
-- **Client-created (online mode)**: a client's handshake creates a new room (server generates and returns a short join code) or joins an existing one by that code. This is what an always-on public `Server` uses — one deployed process hosting many simultaneous matches, none of them pre-existing until a client asks for one. The join code is plain data (a short string), so turning it into a QR code, a deep link, or a typed-in code is entirely up to whatever renders it client-side.
-- **Host-created (embedded/LAN mode)**: `Server.CreateRoom()` makes a room directly, with no client and no network round trip — for an app that *is* the host (e.g. a board on the local network) and wants one fixed room from the moment it starts, instead of waiting for someone to "create" it. A room made this way is immune to the empty-room janitor until it admits its first real client, so it can sit open in a lobby indefinitely.
+If you ever find yourself wanting the core to know what a paddle or a goal is, that logic belongs in your game's hooks, not in a fork of `networkcore`.
 
-Everything downstream — `JoinRoom`, input, snapshots, reconnection — works identically regardless of which path created the room.
+## Building your own game on top of ForgeNet
 
-`go/networkcore` also has a `NetworkClient` (in `client.go`) — Go isn't server-only anymore. Any Go process can `CreateRoom`/`JoinRoom` against a `Server` (this one or another language's), not just host one, which matters for an app that needs to be either side (e.g. embed a `Server` for local/offline play, or connect out as a `NetworkClient` to a deployed one for online play, picking at runtime).
+This section walks through the integration contract using Go (the reference implementation) for code samples — the shape is the same in every language; see each language folder's own docs for exact method names/casing (`csharp/`, `python/`, etc.) and [`docs/STATUS.md`](docs/STATUS.md) for which languages support which side (server/client).
 
-Reconnection is built into `Server`/`NetworkHost`: if a client's connection drops (missed heartbeats) and a new handshake arrives from the same IP into the same room before `ServerOptions.EmptyRoomGracePeriod` elapses, it's treated as the same player — same `PlayerID`, same original `Role` — instead of a stranger joining fresh (`OnPlayerConnected`'s `reconnected` argument tells the game which case it is). This is an IP-based heuristic, not a session token (the protocol doesn't carry one yet), so it's not airtight against two devices sharing one public IP (NAT) both dropping at once — good enough for typical home/mobile-data networks, not a substitute for real session auth on a fully public deployment.
+### 1. Define your room factory and hooks
 
-## Why this exists
+A `RoomFactory` is called once per room — it returns a fresh `NetworkHost` with your game's hooks attached, so every match has its own independent state:
 
-Most open-source netcode libraries commit early to one engine and one language (Mirror and FishNet to Unity/C#, Netcode for GameObjects the same, ENet to a C ABI you bind per-engine). ForgeNet inverts that: the protocol and the state machine are specified once, then implemented natively per language/runtime, so integrating it into a new engine is "write a thin binding," not "port a library."
+```go
+func newGameRoom() *networkcore.NetworkHost {
+    host := networkcore.NewNetworkHost()
+    game := newMyGameState() // your own struct — the core never sees inside it
 
-- **Go** is the reference implementation and the target for classic **Dedicated Server** topology (multi-room, many clients, one centralized process).
-- **C#** targets **Embedded Host** topology — the server runs *inside* the client app (e.g. a Unity build hosting a local match), which is why this is the real base for the Unity integration.
-- **Rust, Python, C++, TypeScript** cover server and/or client roles for embedding into engines and tools built on those runtimes (e.g. native plugins, headless simulation, tooling, Node-based clients).
-- **Web** is not a language, it's a transport: a browser can't open raw UDP sockets, so `web/` talks to `go/networkcore` over WebTransport/QUIC instead — same protocol, different `Peer`.
+    host.OnPlayerConnected = func(playerID uint16, role uint8, reconnected bool) {
+        // role is YOUR value — decide what this connection is allowed to do
+        // reconnected==true: this is the same player as before (see §5) —
+        // don't reset their state, they're resuming
+    }
+    host.OnPlayerDisconnected = func(playerID uint16) {
+        // mark them gone in your own state; the core keeps their session
+        // "reclaimable" for reconnection on its own, you don't manage that
+    }
+    host.OnInput = func(input networkcore.PlayerInput) {
+        // apply movement, or decode packed bits from Actions — see §6
+    }
+    host.OnTick = func(tick uint64) {
+        // step your simulation once per tick (60Hz, matches the core's tick rate)
+    }
+    host.StateProvider = func() []byte {
+        return game.encode() // YOUR binary format — the core just moves these bytes
+    }
+
+    return host
+}
+```
+
+### 2. Start a `Server` with that factory
+
+```go
+server := networkcore.NewServer(newGameRoom, networkcore.ServerOptions{
+    MaxPlayersPerRoom: 4, // purely numeric cap, doesn't know about roles — see §7
+})
+server.StartUDP(9999)                                  // native clients (desktop/mobile)
+server.StartWebTransport(networkcore.WebTransportOptions{Addr: ":9443"}) // browser clients, optional
+```
+
+### 3a. Embedded Host mode: create the room yourself
+
+```go
+roomCode := server.CreateRoom() // no client involved — safe to call at app startup
+// show roomCode (or a LAN-discovery broadcast of it) to other devices
+```
+
+### 3b. Dedicated Server mode: let a client create it
+
+```go
+client := networkcore.NewNetworkClient()
+err := client.CreateRoom("game.example.com", 9999, myRole, 5*time.Second)
+// client.RoomCode is now set — share it (QR, deep link, typed code) for others to JoinRoom
+```
+
+### 4. Everyone else joins
+
+```go
+client := networkcore.NewNetworkClient()
+err := client.JoinRoom(hostOrIP, port, myRole, roomCode, 5*time.Second)
+if err != nil {
+    if rej, ok := err.(*networkcore.HandshakeRejectedError); ok {
+        // rej.Reason == networkcore.ReasonRoomNotFound or ReasonRoomFull
+    }
+}
+
+client.OnSnapshot = func(s *networkcore.GameSnapshot) {
+    // s.StatePayload — decode with YOUR format, s.Events — YOUR event types
+}
+client.SendInput(deltaX, deltaY, rotation, actions, false) // called every tick from your input loop
+```
+
+### 5. Handle reconnection
+
+If a client's connection drops and it calls `JoinRoom` again (same room code) before `ServerOptions.EmptyRoomGracePeriod` (default 30s) elapses, the server recognizes it by IP and hands back the **same `PlayerID`** and the **original `Role`** — `OnPlayerConnected`'s `reconnected` argument tells your game not to treat it as a new player. This is an IP-based heuristic, not a session token — good enough for typical home/mobile-data networks, not airtight against two devices sharing one public IP. See [`docs/PROTOCOL.md`](docs/PROTOCOL.md) for the exact mechanics and [`docs/ROADMAP.md`](docs/ROADMAP.md) for planned session-token hardening.
+
+### 6. Two ways to send events: best-effort vs reliable
+
+```go
+host.QueueEvent(networkcore.GameEvent{PlayerID: id, EventType: myEventGoal, Data: nil})
+// goes out in the next snapshot only — fine for anything with a "newer version coming soon"
+// (like most game state), NOT fine for a one-off notification that must not be silently lost
+
+host.QueueReliableEvent(networkcore.GameEvent{PlayerID: id, EventType: myEventGoal, Data: nil})
+// sent immediately AND retried until the client ACKs it (automatic in every language's client) —
+// use this for anything that changes a score/outcome and can't just disappear on packet loss
+```
+
+### 7. Role-based capacity is your job, not the core's
+
+`ServerOptions.MaxPlayersPerRoom` is a flat numeric cap — the `Server` counts connections, it doesn't know your role values. If you need "exactly 2 paddles + 1 board," enforce that inside `OnPlayerConnected` by checking `role` and your own per-role counters, the same way `ejemplo-tacataca` does it in every language.
+
+### Repurposing `PlayerInput`: a real example
+
+`PlayerInput` only has four fields (`DeltaX`, `DeltaY`, `Rotation`, `Actions`), but nothing says they have to mean "move" and "spin." A real game built on ForgeNet packs an entire lobby UI (side selection, role, team composition, ready state) into the `Actions` bitmask, sent in the *same* packet as movement, every tick — so a lobby choice never gets lost to packet loss (there's always a newer packet on the way) and never races with movement data:
+
+```
+bits 1-2   side: 0=unset, 1=left, 2=right
+bits 3-4   role: 0=unset, 1=solo, 2=attack, 3=defense
+bit 5      ready
+bits 6-20  team composition (three 4-bit counts)
+```
+
+`Rotation` (16 bits, otherwise just "spin") got split in half to carry two independent values — left-hand and right-hand spin — since the game only needed one rotation-shaped number of headroom for something else entirely. The point: the core enforces none of this. It transports `DeltaX/DeltaY/Rotation/Actions` as four numbers and calls `OnInput` — what they mean is a decision you make once, in your own hook, same as `StatePayload`.
+
+## API reference
+
+### `NetworkHost` (one room's game-protocol state)
+
+| Member | Purpose |
+|---|---|
+| `OnPlayerConnected func(playerID uint16, role uint8, reconnected bool)` | Fires on admission — new or reconnecting |
+| `OnPlayerDisconnected func(playerID uint16)` | Fires on heartbeat timeout (~10s of silence) |
+| `OnInput func(input PlayerInput)` | Fires once per received input packet, in order |
+| `OnTick func(tick uint64)` | Fires once per server tick (60Hz) |
+| `StateProvider func() []byte` | Called every tick to build the next snapshot's `StatePayload` |
+| `QueueEvent(evt GameEvent)` | Best-effort event, next snapshot only |
+| `QueueReliableEvent(evt GameEvent)` | Sent now + retried until ACKed (at-least-once — may also still arrive via the next regular snapshot) |
+| `GetClientRole(playerID) (role uint8, ok bool)` | Look up a connected player's role outside the connect hook |
+| `PendingReliableCount(playerID) int` | Diagnostic: how many reliable packets are still unacked for this player |
+| `ConnectedPlayerCount() int` | Currently-connected count (excludes reclaimable-but-disconnected clients) |
+
+### `Server` (multi-room host + transport owner)
+
+| Member | Purpose |
+|---|---|
+| `NewServer(factory RoomFactory, opts ServerOptions) *Server` | `factory` is called once per room |
+| `StartUDP(port uint16) error` | `port=0` binds an OS-assigned ephemeral port |
+| `UDPPort() uint16` | Real bound port (useful after `StartUDP(0)`) |
+| `StartWebTransport(opts WebTransportOptions) (*DevCertificate, error)` | Browser transport, Go only today |
+| `CreateRoom() string` | Direct room creation, no handshake — embedded-host mode (see §3a above) |
+| `Stop()` | Drains all rooms and closes transports — call on shutdown |
+
+**`ServerOptions`**
+
+| Field | Default | Purpose |
+|---|---|---|
+| `RoomCodeLength` | `6` | Length of generated room codes (alphabet excludes ambiguous `0`/`O`/`1`/`I`) |
+| `MaxPlayersPerRoom` | `0` (unlimited) | Flat numeric cap — see §7 above for role-aware caps |
+| `HandshakeRateLimit` / `HandshakeRateLimitWindow` | `10` / `10s` | Handshake attempts allowed per `Peer` per window before silently dropping the rest |
+| `EmptyRoomGracePeriod` | `30s` | How long a room that *had* a player stays alive at zero connections before being destroyed — gives reconnection (§5) a real window. A room made via `CreateRoom()` that never got a player is never subject to this — it waits forever |
+
+**`WebTransportOptions`** (Go only)
+
+| Field | Default | Purpose |
+|---|---|---|
+| `Addr` | — | e.g. `":9443"` |
+| `Path` | `/webtransport` | Endpoint path |
+| `TLSConfig` | dev self-signed cert | Pass a real cert (`LoadTLSCertificate(certFile, keyFile)`) for production |
+| `AllowedOrigins` | unset (any) | Restrict which web origins may open a session |
+
+### `NetworkClient`
+
+| Member | Purpose |
+|---|---|
+| `CreateRoom(host, port, role, timeout) error` | Handshake that makes a new room |
+| `JoinRoom(host, port, role, roomCode, timeout) error` | Handshake that joins an existing room |
+| `PlayerID`, `RoomCode` | Set after a successful handshake |
+| `OnSnapshot func(*GameSnapshot)` | Fires on every received snapshot |
+| `OnPong func(ms int)` | Fires on ping response |
+| `OnClosed func()` | Fires if the connection drops |
+| `SendInput(deltaX, deltaY int16, rotation uint16, actions uint32, reliable bool)` | Send this tick's input |
+| `SendPing()` | Measure RTT |
+| `Disconnect()` | Clean local shutdown |
+
+A failed `CreateRoom`/`JoinRoom` returns a `*HandshakeRejectedError{Reason}` when the server explicitly rejected it (`ReasonRoomNotFound`, `ReasonRoomFull`) — any other error (timeout, DNS) is a plain `error`.
 
 ## Status
 
-- All 6 implementations are compiled and actually run (not just written) — see the per-language breakdown below.
-- Browser support (WebTransport/QUIC) validated against real Chrome via Playwright, not just compiled: handshake, input, and full game-state decoding in the browser.
-- Cross-language interoperability verified with real cross-process tests, not just self-consistency:
-  - **C# ↔ Go**: `csharp/NetworkCore.Tests` spawns `go/ejemplo-tacataca` as a real subprocess and connects a C# `NetworkClient` against it.
-  - **TypeScript ↔ Go**: `typescript/test-networkcore.ts` connects against a running `go/ejemplo-tacataca`, decoding the full example schema byte-for-byte across languages.
-- A heartbeat bug (last-activity timestamp never refreshed, causing disconnects after ~10s regardless of traffic) was found and fixed across 4 languages (Go, Rust, Python, C++), each with its own regression test.
+- All 6 implementations are compiled and actually run (not just written) — see [`docs/STATUS.md`](docs/STATUS.md) for the full per-language capability matrix (server/client role, rooms, reconnection, WebTransport).
+- Browser support (WebTransport/QUIC) validated against real Chrome via Playwright: handshake, input, and full game-state decoding in the browser.
+- Cross-language interoperability verified with real cross-process tests, not just self-consistency — C# ↔ Go and TypeScript ↔ Go each connect a real client against a real `go/ejemplo-tacataca` subprocess.
 
 ## Repository layout
 
 ```
-go/           server + client — Go is the reference implementation for the
-              classic Dedicated Server topology. Accepts UDP and
-              WebTransport at once, in the same match; NetworkClient lets
-              any Go process connect out to a Server too (this one or
-              another language's).
+go/           server + client — the reference implementation. Accepts UDP
+              and WebTransport at once, in the same match; the only
+              language with WebTransport support server-side.
 rust/         server
-python/       server + client — the only other language with both roles
+python/       server + client
 cpp/          server, header-only, C++17, no external dependencies
 typescript/   client (Node.js, via dgram)
 csharp/       server (embedded host) + client — the real base for Unity
@@ -66,6 +248,8 @@ csharp/       server (embedded host) + client — the real base for Unity
 web/          browser client via WebTransport/QUIC — a browser can't open
               UDP sockets, so it talks to the same go/networkcore over a
               different transport
+docs/         engine internals: architecture, wire protocol spec, roadmap
+              — read this if you're modifying ForgeNet itself
 ```
 
 ## Quick start (per language)
@@ -95,11 +279,11 @@ cd web && npm install && npx tsc
 cd ../go/ejemplo-tacataca && go run .   # then open http://localhost:8080/
 ```
 
-Full per-language detail (test counts, design notes, known caveats) lives inline in each folder; see `csharp/`, `go/`, etc.
+Also usable as a real dependency, not just vendored: `go get github.com/mgueregath/ForgeNet/go@latest` (tagged releases follow the `go/vX.Y.Z` convention required for a Go module living in a subdirectory).
 
-## Running `go/networkcore` as an online server
+## Deploying `go/networkcore` as an online server
 
-`Server` (in `go/networkcore/server.go`) is meant to run continuously and host many concurrent matches — this is what backs `ejemplo-tacataca`. Configuration is by environment variable, so the same binary runs unmodified in a container:
+`Server` is meant to run continuously and host many concurrent matches — this is what backs `ejemplo-tacataca`, and the reference for Dedicated Server mode (see [The two modes](#the-two-modes)). Configuration is by environment variable, so the same binary runs unmodified in a container:
 
 | Variable | Default | Purpose |
 |---|---|---|
@@ -107,27 +291,22 @@ Full per-language detail (test counts, design notes, known caveats) lives inline
 | `WEBTRANSPORT_ADDR` | `:9443` | WebTransport/QUIC listener address |
 | `HTTP_ADDR` | `:8080` | Serves the browser test page + `/certhash` |
 | `WEB_DIR` | `../../web` | Static files for the browser page; skipped (server still runs) if the path doesn't exist |
-| `TLS_CERT_FILE` / `TLS_KEY_FILE` | unset | A real CA certificate (e.g. from Let's Encrypt/Certbot run separately) for WebTransport. Unset falls back to the self-signed dev certificate (`GenerateDevCertificate`), which is fine for local testing but not for production — browsers only accept it via the `serverCertificateHashes` pinning dance, not as a trusted CA |
-| `ALLOWED_ORIGINS` | unset (any) | Comma-separated origins allowed to open a WebTransport session. Leaving this unset accepts any origin, which is fine for local dev but means any web page could open a session against a public deployment |
-| `MAX_PLAYERS_PER_ROOM` | `3` (taca-taca specific: 2 paddles + 1 board) | Generic numeric cap per room, enforced by `Server` regardless of role |
+| `TLS_CERT_FILE` / `TLS_KEY_FILE` | unset | A real CA certificate (e.g. from Let's Encrypt/Certbot run separately). Unset falls back to the self-signed dev certificate, fine for local testing but not production |
+| `ALLOWED_ORIGINS` | unset (any) | Comma-separated origins allowed to open a WebTransport session |
+| `MAX_PLAYERS_PER_ROOM` | `3` (taca-taca specific) | See §7 above |
 
-Also built in: a handshake rate limit per `Peer` (`ServerOptions.HandshakeRateLimit`, default 10 attempts/10s — throttles a broken/looping client or a simple single-source flood, not a distributed one); `QueueReliableEvent` for game events that must survive real packet loss (retransmitted via the same reliable-delivery machinery used for input, until the client ACKs — Go's own `NetworkClient` handles this ACK automatically); and `ServerOptions.EmptyRoomGracePeriod` (default 30s) — a room that had players but is momentarily at zero doesn't get torn down instantly, so a dropped connection has a real window to reconnect (see IP-based reconnection above) before its room disappears.
-
-The process handles `SIGTERM`/`SIGINT` by draining (`Server.Stop()`, which stops every room's loops and closes the transports) before exiting — needed for `docker stop` or a rolling redeploy to not just kill active matches outright.
+The process handles `SIGTERM`/`SIGINT` by draining (`Server.Stop()`) before exiting — needed for `docker stop` or a rolling redeploy to not just kill active matches outright.
 
 ```bash
 docker build -t forgenet-tacataca .
 docker run --rm -p 9999:9999/udp -p 9443:9443/udp -p 8080:8080/tcp forgenet-tacataca
 ```
 
-## Roadmap
+## Where to go next
 
-The near-term goal is packaging this as an embeddable library per engine rather than a standalone example:
-
-1. **Unity**: a thin `MonoBehaviour` wrapper around `csharp/NetworkCore`'s embedded host, for offline/LAN play — instantiate a real server inside the app when a player hosts a match, and a matching client-only mode ("controller" role) that never renders the authoritative state.
-2. **Online play**: a `NetworkClient` mode that connects to a standalone `go/networkcore` `Server` deployment instead of an embedded host — for taca-taca specifically, the board becomes a client like any paddle controller (just a different `role` value), creates a room on start, and turns the returned join code into a QR for the paddles to scan. `Server` itself is now hardened for this (see above) and Go now has a real `NetworkClient` to do this from; reconnection by IP is also built in now (see above). Still missing before real public exposure: per-session auth tokens (raw UDP still has none — a client's identity is its transport address, which can be spoofed; the IP-based reconnection heuristic isn't a substitute for real session auth either).
-3. **Role selection + LAN discovery** at app startup — mDNS/Bonjour/NSD from day one (confirmed necessary for iOS; raw UDP broadcast doesn't reach it).
-4. **Godot / Unreal bindings** built the same way: thin native bindings over the existing `cpp/` or language-native cores, no protocol changes required.
+- Modifying or extending ForgeNet itself → [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), [`docs/PROTOCOL.md`](docs/PROTOCOL.md), [`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md)
+- What's implemented where → [`docs/STATUS.md`](docs/STATUS.md)
+- What's planned → [`docs/ROADMAP.md`](docs/ROADMAP.md)
 
 ## License
 
